@@ -1,6 +1,7 @@
 """
-VOD2MLIB — VOD .strm Generator Plugin for Dispatcharr
-v1.9.1 — trim two action descriptions to keep buttons right-aligned
+VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
+(slug: vod2mlib)
+v1.9.2 — display name change: 'VOD2MLIB' → 'VOD to Media Library'
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -17,8 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
-    name = "VOD2MLIB"
-    version = "1.9.1"
+    name = "VOD to Media Library"
+    version = "1.9.2"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
         "optional NFO metadata, batch processing, and a cron-driven auto-rescan."
