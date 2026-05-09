@@ -1,6 +1,6 @@
 """
 VOD2MLIB — VOD .strm Generator Plugin for Dispatcharr
-v1.8.0 — manifest-side UX pass: settings-tab section dividers + design-aligned action labels
+v1.8.1 — full-rescan confirm dialog + tighter description
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -18,7 +18,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD2MLIB"
-    version = "1.8.0"
+    version = "1.8.1"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files. "
         "Map a host folder to /VODS in your Dispatcharr container, then click "
@@ -182,10 +182,15 @@ class Plugin:
         {
             "id": "rescan_all",
             "label": "[GENERATE] Full rescan",
-            "description": "Scan, then Movies, then Series — Refresh Existing forced ON. What cron fires.",
+            "description": "Rescan then force regenerate Movies + Series. What cron fires.",
             "button_label": "Rescan all",
             "button_variant": "filled",
             "button_color": "teal",
+            "confirm": {
+                "required": True,
+                "title": "Run full rescan now?",
+                "message": "Full rescan walks every Movie and every Series, re-fetching episode lists from the M3U source and writing any missing files. On large catalogues this can take many minutes. The cron schedule already runs this action nightly — only click here for an immediate refresh.",
+            },
         },
         {
             "id": "schedule_status",
