@@ -1,6 +1,7 @@
 """
 VOD2MLIB — VOD .strm Generator Plugin for Dispatcharr
-v1.8.2 — settings-tab section headers use [BRACKET] style to match Actions tab
+v1.9.0 — maintenance pass: NFO title fix, shared regex, movie batch refactor,
+         test-fire action, surfaced failures, tunables as class constants, tests
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -18,16 +19,29 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD2MLIB"
-    version = "1.8.2"
+    version = "1.9.0"
     description = (
-        "Convert Dispatcharr VODs into media-server-friendly .strm files. "
-        "Map a host folder to /VODS in your Dispatcharr container, then click "
-        "'Scan for VODs' to see totals and 'Generate Movie/Series .strm Files' "
-        "to process them in batches. Series episodes are auto-fetched per series "
-        "with 3 parallel workers. Use 'Apply Schedule' to enable a cron-driven "
-        "auto-rescan. If you hit a UI glitch, hard-refresh the browser (Cmd/Ctrl+Shift+R)."
+        "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
+        "optional NFO metadata, batch processing, and a cron-driven auto-rescan."
     )
-    
+
+    # Tunables
+    MAX_WORKERS = 3
+    LOG_EVERY = 50
+    LOG_FIRST_N = 10
+    MAX_FILENAME_LEN = 200
+
+    # Schedule task identity (django-celery-beat row name + Celery task name)
+    SCHEDULE_TASK_NAME = "vod2mlib.auto_rescan"
+    SCHEDULED_TASK_CELERY_NAME = "vod2mlib.scheduled_rescan"
+
+    # File suffixes the plugin writes (used by cleanup and skip logic)
+    _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
+
+    # Title cleaning. Whitespace required before the dash so 'AC-130' is preserved.
+    _LANGUAGE_PREFIX_RE = re.compile(r'^[A-Z]{2,3}\s+-\s*')
+    _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
+
     fields = [
         {
             "id": "_about",
@@ -152,8 +166,6 @@ class Plugin:
         }
     ]
 
-    SCHEDULE_TASK_NAME = "vod2mlib.auto_rescan"
-    
     actions = [
         {
             "id": "scan_all_vods",
@@ -199,6 +211,19 @@ class Plugin:
             "button_label": "Status",
             "button_variant": "outline",
             "button_color": "blue",
+        },
+        {
+            "id": "schedule_test_fire",
+            "label": "[SCHEDULE] Test fire now",
+            "description": "Run the registered scheduled task synchronously, with the snapshotted settings. Verifies the cron pipeline end-to-end without waiting for the next tick.",
+            "button_label": "Test fire",
+            "button_variant": "outline",
+            "button_color": "blue",
+            "confirm": {
+                "required": True,
+                "title": "Fire scheduled task now?",
+                "message": "Runs the same action the cron will fire (with the snapshotted settings) right now. Useful to verify the pipeline works. May take many minutes depending on the action.",
+            },
         },
         {
             "id": "apply_schedule",
@@ -277,6 +302,8 @@ class Plugin:
             return self._remove_schedule(settings, logger)
         elif action == "schedule_status":
             return self._schedule_status(settings, logger)
+        elif action == "schedule_test_fire":
+            return self._schedule_test_fire(settings, logger)
 
         return {"status": "error", "message": f"Unknown action: {action}"}
     
@@ -315,209 +342,147 @@ class Plugin:
             logger.error("Scan failed: %s", e)
             return {"status": "error", "message": f"Scan error: {e}"}
     
+    def _movie_target_paths(self, movie, root_folder: str):
+        """Compute the (folder_path, strm_filename, clean_name, year) for a movie."""
+        raw_name = movie.name or f"Unknown Movie {movie.id}"
+        clean_name = self._clean_title(raw_name)
+        clean_name, title_year = self._strip_trailing_year(clean_name)
+        year = movie.year or title_year
+        safe = self._sanitize_filename(clean_name)
+        if year:
+            folder_name = f"{safe} ({year})"
+            strm_filename = f"{safe} ({year}).strm"
+        else:
+            folder_name = safe
+            strm_filename = f"{safe}.strm"
+        return os.path.join(root_folder, folder_name), strm_filename, clean_name, year
+
     def _generate_movies(self, settings: Dict[str, Any], logger):
-        """Generate movie .strm files according to batch size."""
+        """Generate movie .strm files according to batch size.
+
+        Lazily walks M3UMovieRelation via iterator() so the batch limit is
+        honoured even when most candidates are already-done. Stops scanning
+        as soon as target_batch new files have been written.
+        """
         root_folder = settings.get("root_folder", "/VODS/Movies")
         dispatcharr_url = settings.get("dispatcharr_url", "http://192.168.99.11:9191").rstrip("/")
         batch_size = settings.get("batch_size") or "250"
         generate_nfo = settings.get("generate_nfo", True)
-        
-        # Validate URL is not localhost
+
         if "localhost" in dispatcharr_url.lower() or "127.0.0.1" in dispatcharr_url:
-            logger.error("=" * 60)
-            logger.error("CONFIGURATION ERROR!")
-            logger.error("Dispatcharr URL is set to localhost/127.0.0.1")
-            logger.error("This will NOT work in media servers!")
-            logger.error("")
-            logger.error("Current setting: %s", dispatcharr_url)
-            logger.error("Change to: http://192.168.99.11:9191 (or your actual IP)")
-            logger.error("=" * 60)
+            logger.error("Dispatcharr URL is localhost/127.0.0.1 — won't work for media servers.")
             return {
                 "status": "error",
-                "message": "Dispatcharr URL must be an actual IP address, not localhost! Update settings and try again."
+                "message": "Dispatcharr URL must be a reachable IP/hostname, not localhost."
             }
-        
-        logger.info("")
-        logger.info("Configuration:")
-        logger.info("  Root Folder: %s", root_folder)
-        logger.info("  Dispatcharr URL: %s", dispatcharr_url)
-        logger.info("  Batch Size: %s", batch_size)
-        logger.info("  Generate NFO: %s", "Yes" if generate_nfo else "No")
-        logger.info("")
-        
-        # Import Django models
+
+        self._log_config(logger, {
+            "Root Folder": root_folder,
+            "Dispatcharr URL": self._mask_url(dispatcharr_url),
+            "Batch Size": batch_size,
+            "Generate NFO": "Yes" if generate_nfo else "No",
+        })
+
         try:
-            from apps.vod.models import Movie, M3UMovieRelation
-            from apps.m3u.models import M3UAccount
+            from apps.vod.models import M3UMovieRelation
         except ImportError as e:
             logger.error("Failed to import models: %s", e)
             return {"status": "error", "message": f"Import error: {e}"}
-        
-        # Get total count first
-        logger.info("Scanning database...")
+
         try:
-            total_count = M3UMovieRelation.objects.count()
-            logger.info("Total VODs in database: %d", total_count)
-            logger.info("")
-        except Exception as e:
-            logger.error("Failed to count VODs: %s", e)
-            return {"status": "error", "message": f"Database error: {e}"}
-        
-        # Get movies based on batch size
-        logger.info("Querying movies for this batch...")
-        try:
-            # Get movies with their M3U relations
             query = M3UMovieRelation.objects.select_related('movie', 'm3u_account', 'category')
-            filtered_count = query.count()
-            
-            if batch_size == "all":
-                movie_relations = list(query)
-                logger.info("Processing ALL %d movies", filtered_count)
-                target_batch = filtered_count
-            else:
-                target_batch = int(batch_size)
-                # Fetch 3x batch size to account for skips
-                fetch_size = min(target_batch * 3, filtered_count)
-                movie_relations = list(query[:fetch_size])
-                logger.info("Fetching %d movies to process batch of %d", fetch_size, target_batch)
-            
-            if not movie_relations:
-                logger.warning("No movies found in database!")
-                return {
-                    "status": "ok",
-                    "message": "No movies found to process",
-                    "processed": 0
-                }
-            
-            logger.info("Found %d movies to process", len(movie_relations))
-            logger.info("")
-            
+            total_count = query.count()
+            if total_count == 0:
+                return {"status": "ok", "message": "No movies found to process", "processed": 0}
+            target_batch = total_count if batch_size == "all" else int(batch_size)
+            logger.info("Total relations: %d. Target batch: %s", total_count, "all" if batch_size == "all" else target_batch)
         except Exception as e:
             logger.error("Database query failed: %s", e)
             return {"status": "error", "message": f"Database error: {e}"}
-        
-        # Ensure root folder exists
+
         try:
             os.makedirs(root_folder, exist_ok=True)
-            logger.info("Root folder ready: %s", root_folder)
-            logger.info("")
-        except Exception as e:
-            logger.error("Failed to create root folder: %s", e)
+        except OSError as e:
             return {"status": "error", "message": f"Folder creation error: {e}"}
-        
-        # Process movies until we've created the target batch
+
         created_strm = 0
         created_nfo = 0
         skipped = 0
         errors = 0
-        processed = 0
-        
+        scanned = 0
+
         logger.info("Processing movies:")
         logger.info("-" * 60)
-        
-        for idx, relation in enumerate(movie_relations, 1):
-            processed += 1
-            movie = relation.movie
-            stream_id = relation.stream_id
-            
-            raw_name = movie.name or f"Unknown Movie {movie.id}"
-            movie_name = self._clean_title(raw_name)
-            movie_name, title_year = self._strip_trailing_year(movie_name)
-            year = movie.year or title_year
 
-            safe_name = self._sanitize_filename(movie_name)
-            if year:
-                folder_name = f"{safe_name} ({year})"
-                strm_filename = f"{safe_name} ({year}).strm"
-            else:
-                folder_name = safe_name
-                strm_filename = f"{safe_name}.strm"
-            
-            # Create movie folder and paths
-            movie_folder = os.path.join(root_folder, folder_name)
+        for relation in query.iterator():
+            scanned += 1
+            movie = relation.movie
+            movie_folder, strm_filename, movie_name, year = self._movie_target_paths(movie, root_folder)
             strm_path = os.path.join(movie_folder, strm_filename)
-            
-            # Check if already processed
+
             if os.path.exists(strm_path):
                 skipped += 1
-                if idx % 50 == 1 or idx <= 10:
-                    logger.info("")
-                    logger.info("[%d/%d] %s - Already exists, skipping", idx, len(movie_relations), movie_name)
                 continue
-            
-            # Stop if we've created enough for this batch (unless processing all)
-            if batch_size != "all" and created_strm >= target_batch:
+
+            proxy_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
+
+            log_this = (created_strm + 1) % self.LOG_EVERY == 1 or created_strm < self.LOG_FIRST_N
+            if log_this:
                 logger.info("")
-                logger.info("Batch complete! Created %d movies.", target_batch)
-                break
-            
-            # Build proxy URL
-            proxy_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={stream_id}"
-            
-            # Log every 50th movie to avoid spam
-            if idx % 50 == 1 or idx <= 10:
-                logger.info("")
-                logger.info("[%d/%d] %s", idx, len(movie_relations), movie_name)
-                logger.info("  Year: %s", year if year else "Unknown")
-                logger.info("  Folder: %s", folder_name)
-                logger.info("  UUID: %s", movie.uuid)
-                logger.info("  Stream ID: %s", stream_id)
-            
+                logger.info("[%d created / %d scanned] %s (%s)", created_strm + 1, scanned, movie_name, year or "—")
+
             try:
-                # Create folder
                 os.makedirs(movie_folder, exist_ok=True)
-                
-                # Write .strm file
                 with open(strm_path, 'w', encoding='utf-8') as f:
                     f.write(proxy_url)
                 created_strm += 1
-                
-                # Write .nfo file if enabled
+
                 if generate_nfo:
                     nfo_filename = strm_filename.replace('.strm', '.nfo')
                     nfo_path = os.path.join(movie_folder, nfo_filename)
-                    
                     category_name = relation.category.name if relation.category else ""
-                    nfo_content = self._generate_nfo(movie, category_name)
-                    
                     with open(nfo_path, 'w', encoding='utf-8') as f:
-                        f.write(nfo_content)
+                        f.write(self._generate_nfo(movie, category_name))
                     created_nfo += 1
-                
-                if idx % 50 == 1 or idx <= 10:
-                    logger.info("  ✓ Created: .strm%s", " + .nfo" if generate_nfo else "")
-                
-            except Exception as e:
-                logger.error("  ✗ Error: %s", e)
+
+                if log_this:
+                    logger.info("  ✓ wrote .strm%s", " + .nfo" if generate_nfo else "")
+            except OSError as e:
+                logger.error("  ✗ %s: %s", movie_name, e)
                 errors += 1
-        
+
+            if batch_size != "all" and created_strm >= target_batch:
+                logger.info("")
+                logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
+                break
+
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY:")
-        logger.info("  Total in DB:    %d", total_count)
-        logger.info("  Examined:       %d", processed)
-        logger.info("  .strm created:  %d", created_strm)
+        logger.info("  Total relations: %d", total_count)
+        logger.info("  Scanned:         %d", scanned)
+        logger.info("  Already on disk: %d", skipped)
+        logger.info("  .strm created:   %d", created_strm)
         if generate_nfo:
-            logger.info("  .nfo created:   %d", created_nfo)
-        logger.info("  Skipped:        %d", skipped)
-        logger.info("  Errors:         %d", errors)
+            logger.info("  .nfo created:    %d", created_nfo)
+        logger.info("  Errors:          %d", errors)
         logger.info("=" * 60)
-        logger.info("")
-        logger.info("Complete! Check your media server to verify playback.")
-        
-        summary_msg = f"Created {created_strm} .strm files"
-        if generate_nfo:
-            summary_msg += f" + {created_nfo} .nfo files"
-        
+
+        summary_msg = f"Wrote {created_strm} new .strm files"
+        if generate_nfo and created_nfo:
+            summary_msg += f" + {created_nfo} .nfo"
+        if skipped:
+            summary_msg += f" ({skipped} already on disk)"
+
         return {
             "status": "ok",
             "message": summary_msg,
             "total_in_db": total_count,
-            "processed": processed,
+            "scanned": scanned,
             "created_strm": created_strm,
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
-            "errors": errors
+            "errors": errors,
         }
     
     def _series_target_folder(self, series, series_root: str):
@@ -553,15 +518,14 @@ class Plugin:
         if "localhost" in dispatcharr_url.lower() or "127.0.0.1" in dispatcharr_url:
             return {"status": "error", "message": "Dispatcharr URL must be an actual IP address!"}
 
-        logger.info("")
-        logger.info("Configuration:")
-        logger.info("  Series Root: %s", series_root)
-        logger.info("  Dispatcharr URL: %s", dispatcharr_url)
-        logger.info("  Batch Size: %s", batch_size)
-        logger.info("  Generate NFO: %s", "Yes" if generate_nfo else "No")
-        logger.info("  Refresh Existing: %s", "Yes" if refresh_existing else "No")
-        logger.info("  Threading: ENABLED (3 workers)")
-        logger.info("")
+        self._log_config(logger, {
+            "Series Root": series_root,
+            "Dispatcharr URL": self._mask_url(dispatcharr_url),
+            "Batch Size": batch_size,
+            "Generate NFO": "Yes" if generate_nfo else "No",
+            "Refresh Existing": "Yes" if refresh_existing else "No",
+            "Workers": self.MAX_WORKERS,
+        })
 
         try:
             from apps.vod.models import M3USeriesRelation
@@ -630,11 +594,12 @@ class Plugin:
         errors = 0
         series_created = 0
         series_uptodate = 0
+        failures = []
 
-        logger.info("Processing %d series with 3 parallel workers:", len(to_process))
+        logger.info("Processing %d series with %d parallel workers:", len(to_process), self.MAX_WORKERS)
         logger.info("-" * 60)
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
                     self._process_single_series,
@@ -649,11 +614,14 @@ class Plugin:
             }
 
             for idx, future in enumerate(as_completed(futures), 1):
+                series_rel = futures[future]
                 try:
                     result = future.result()
                 except Exception as e:
-                    logger.error("[%d/%d] Worker raised: %s", idx, len(futures), e)
+                    name = getattr(getattr(series_rel, "series", None), "name", "?")
+                    logger.error("[%d/%d] Worker raised for '%s': %s", idx, len(futures), name, e)
                     errors += 1
+                    failures.append(f"{name}: {e}")
                     continue
 
                 if result.get("uptodate"):
@@ -664,6 +632,7 @@ class Plugin:
                     created_nfo += result["nfo_files"]
                 if "error" in result:
                     errors += 1
+                    failures.append(f"{result.get('series_name', '?')}: {result['error']}")
                 logger.info("[%d/%d] %s", idx, len(futures), result["message"])
         
         logger.info("")
@@ -686,6 +655,14 @@ class Plugin:
             if generate_nfo and created_nfo:
                 summary_msg += f" + {created_nfo} NFO"
 
+        if failures:
+            logger.info("")
+            logger.info("Failed series:")
+            for f in failures[:20]:
+                logger.info("  - %s", f)
+            if len(failures) > 20:
+                logger.info("  ... and %d more", len(failures) - 20)
+
         return {
             "status": "ok",
             "message": summary_msg,
@@ -694,6 +671,7 @@ class Plugin:
             "episodes_created": created_strm,
             "nfo_created": created_nfo if generate_nfo else 0,
             "errors": errors,
+            "failures": failures,
         }
     
     def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False):
@@ -820,8 +798,6 @@ class Plugin:
                 "message": f"{series_name} - ✗ Error: {e}",
             }
     
-    _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
-
     def _delete_plugin_files_in_dir(self, dir_path: str, logger):
         """Delete only .strm and .nfo files in dir_path. Returns (strm_deleted, nfo_deleted, errors)."""
         strm = nfo = errors = 0
@@ -855,6 +831,29 @@ class Plugin:
             return True
         except OSError:
             return False
+
+    def _log_config(self, logger, items: Dict[str, Any]) -> None:
+        """Log a 'Configuration:' block with key/value pairs."""
+        logger.info("")
+        logger.info("Configuration:")
+        for k, v in items.items():
+            logger.info("  %s: %s", k, v)
+        logger.info("")
+
+    def _mask_url(self, url: str) -> str:
+        """Mask the host portion of a URL for log output (keeps scheme + path)."""
+        if not url:
+            return url
+        match = re.match(r'^(https?://)([^/]+)(/.*)?$', url)
+        if not match:
+            return url
+        scheme, host, path = match.group(1), match.group(2), match.group(3) or ''
+        if ':' in host:
+            host_only, port = host.rsplit(':', 1)
+            host_masked = '<host>' + ':' + port
+        else:
+            host_masked = '<host>'
+        return scheme + host_masked + path
 
     def _cleanup_movies(self, settings: Dict[str, Any], logger):
         """Delete plugin-generated .strm and .nfo files under the movies root.
@@ -1012,9 +1011,6 @@ class Plugin:
             "errors": errors,
         }
     
-    _LANGUAGE_PREFIX_RE = re.compile(r'^[A-Z]{2,3}\s+-\s*')
-    _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
-
     def _clean_title(self, title: str) -> str:
         """Remove language prefixes like 'EN - ', 'FR - ' from titles.
 
@@ -1043,10 +1039,11 @@ class Plugin:
         """Extract genre names from category name."""
         if not category_name:
             return []
-        
-        # Remove common prefixes (EN -, FR -, US -, etc.)
-        genre_text = re.sub(r'^[A-Z]{2,3}\s*-\s*', '', category_name)
-        
+
+        # Strip language prefix using the same regex as _clean_title to avoid
+        # the AC-130-becomes-130 over-strip bug.
+        genre_text = self._LANGUAGE_PREFIX_RE.sub('', category_name)
+
         # Remove (movie) or (series) suffix
         genre_text = re.sub(r'\s*\((movie|series)\)\s*$', '', genre_text, flags=re.IGNORECASE)
         
@@ -1066,10 +1063,10 @@ class Plugin:
     
     def _generate_tvshow_nfo(self, series, category_name: str) -> str:
         """Generate tvshow.nfo XML content for a series."""
-        # Extract basic info (clean language prefix)
         raw_title = series.name or "Unknown"
         title = self._clean_title(raw_title)
-        year = series.year or ""
+        title, title_year = self._strip_trailing_year(title)
+        year = series.year or title_year or ""
         plot = series.description or ""
         
         # Extract genres from category
@@ -1095,9 +1092,9 @@ class Plugin:
     
     def _generate_episode_nfo(self, episode) -> str:
         """Generate episode.nfo XML content for an episode."""
-        # Extract episode info (clean language prefix)
         raw_title = episode.name or ""
         title = self._clean_title(raw_title) if raw_title else "Episode"
+        title, _ = self._strip_trailing_year(title)
         season_num = episode.season_number or 0
         episode_num = episode.episode_number or 0
         plot = episode.description or ""
@@ -1118,10 +1115,10 @@ class Plugin:
     
     def _generate_nfo(self, movie, category_name: str) -> str:
         """Generate NFO XML content for a movie."""
-        # Extract basic info (clean language prefix)
         raw_title = movie.name or "Unknown"
         title = self._clean_title(raw_title)
-        year = movie.year or ""
+        title, title_year = self._strip_trailing_year(title)
+        year = movie.year or title_year or ""
         plot = movie.description or ""
         rating = movie.rating or ""
         tmdb_id = movie.tmdb_id or ""
@@ -1181,7 +1178,7 @@ class Plugin:
         name = re.sub(r'\s+', ' ', name)
         
         # Trim and limit length
-        name = name.strip()[:200]
+        name = name.strip()[:self.MAX_FILENAME_LEN]
         
         # Remove trailing dots/spaces (Windows issue)
         name = name.rstrip('. ')
@@ -1216,12 +1213,28 @@ class Plugin:
         series_settings = {**settings, "refresh_existing": True}
         series = self._generate_series(series_settings, logger)
 
-        movie_msg = movies.get("message", "movies skipped")
-        series_msg = series.get("message", "series skipped")
+        m = movies if isinstance(movies, dict) else {}
+        s = series if isinstance(series, dict) else {}
+
+        movie_strm = m.get("created_strm", 0)
+        movie_skipped = m.get("skipped", 0)
+        ep_new = s.get("episodes_created", 0)
+        sc_new = s.get("series_processed", 0)
+        sc_uptodate = s.get("series_uptodate", 0)
+        total_errors = m.get("errors", 0) + s.get("errors", 0)
+
+        message = (
+            f"Rescan complete. Movies: {movie_strm} new"
+            f"{f' ({movie_skipped} on disk)' if movie_skipped else ''}. "
+            f"Series: {ep_new} new episodes across {sc_new} series"
+            f"{f' ({sc_uptodate} up-to-date)' if sc_uptodate else ''}."
+        )
+        if total_errors:
+            message += f" {total_errors} errors — see logs."
 
         return {
             "status": "ok",
-            "message": f"Rescan complete — {movie_msg}; {series_msg}",
+            "message": message,
             "scan": scan,
             "movies": movies,
             "series": series,
@@ -1238,12 +1251,23 @@ class Plugin:
             )
         return tuple(parts)
 
+    def _valid_schedule_targets(self) -> set:
+        """The action ids that are valid as scheduled targets.
+
+        Derived from the schedule_target field's options so the source of
+        truth is the manifest, not a hardcoded set.
+        """
+        for f in self.fields:
+            if f.get("id") == "schedule_target":
+                return {opt["value"] for opt in f.get("options", []) if opt.get("value")}
+        return set()
+
     def _apply_schedule(self, settings: Dict[str, Any], logger):
         """Register or update a periodic auto-rescan task via django-celery-beat."""
         cron_expr = settings.get("schedule_cron") or "0 3 * * *"
         target = settings.get("schedule_target") or "rescan_all"
 
-        valid_targets = {"scan_all_vods", "generate_movies", "generate_series", "rescan_all"}
+        valid_targets = self._valid_schedule_targets()
         if target not in valid_targets:
             return {"status": "error", "message": f"Invalid schedule_target: {target}"}
 
@@ -1280,7 +1304,7 @@ class Plugin:
             name=self.SCHEDULE_TASK_NAME,
             defaults={
                 "crontab": schedule,
-                "task": "vod2mlib.scheduled_rescan",
+                "task": self.SCHEDULED_TASK_CELERY_NAME,
                 "kwargs": json.dumps({"action": target, "settings": snapshot}),
                 "enabled": True,
                 "description": f"Auto-rescan for {self.name} v{self.version}",
@@ -1372,15 +1396,56 @@ class Plugin:
             "total_run_count": task.total_run_count,
         }
 
+    def _schedule_test_fire(self, settings: Dict[str, Any], logger):
+        """Synchronously run the action+settings stored in the registered schedule.
+
+        Verifies the cron pipeline end-to-end without waiting for the next tick.
+        Reads the PeriodicTask kwargs (NOT the live settings) so this is a true
+        replay of what the scheduler will fire.
+        """
+        try:
+            from django_celery_beat.models import PeriodicTask
+        except ImportError:
+            return {"status": "error", "message": "django-celery-beat not installed."}
+
+        task = PeriodicTask.objects.filter(name=self.SCHEDULE_TASK_NAME).first()
+        if not task:
+            return {"status": "error", "message": "No schedule registered. Click Apply first."}
+
+        import json
+        try:
+            kwargs = json.loads(task.kwargs or "{}")
+        except json.JSONDecodeError as e:
+            return {"status": "error", "message": f"Stored task kwargs invalid JSON: {e}"}
+
+        action = kwargs.get("action") or "rescan_all"
+        snapshot_settings = kwargs.get("settings") or {}
+
+        if action not in self._valid_schedule_targets():
+            return {"status": "error", "message": f"Stored action '{action}' is not a valid target."}
+
+        logger.info("Test-firing schedule: action=%s with %d snapshotted settings", action, len(snapshot_settings))
+        result = self.run(action, {}, {"logger": logger, "settings": snapshot_settings})
+        msg = (result or {}).get("message", "(no message)")
+        return {
+            "status": "ok",
+            "message": f"Test fire complete ({action}): {msg}",
+            "fired_action": action,
+            "result": result,
+        }
+
 
 try:
     from celery import shared_task as _vod2mlib_shared_task
 
-    @_vod2mlib_shared_task(name="vod2mlib.scheduled_rescan")
+    @_vod2mlib_shared_task(name=Plugin.SCHEDULED_TASK_CELERY_NAME)
     def _vod2mlib_scheduled_rescan(action="rescan_all", settings=None):
         """Celery entry point invoked by the periodic task registered via _apply_schedule."""
         import logging
         logger = logging.getLogger("vod2mlib.schedule")
         return Plugin().run(action, {}, {"logger": logger, "settings": settings or {}})
-except Exception:
-    pass
+except Exception as _celery_register_err:
+    # Celery may not be importable in some environments. Log to stderr so the
+    # cause is visible if the user wonders why scheduled rescans never run.
+    import sys as _sys
+    print(f"[vod2mlib] Celery task registration failed: {_celery_register_err}", file=_sys.stderr)

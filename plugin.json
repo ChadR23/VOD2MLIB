@@ -1,7 +1,7 @@
 {
   "name": "VOD2MLIB",
-  "version": "1.8.2",
-  "description": "Generate .strm files for Dispatcharr VOD movies and series, with optional NFO metadata, batch processing, and scheduled auto-rescan that picks up newly-added episodes.",
+  "version": "1.9.0",
+  "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
   "min_dispatcharr_version": "v0.24.0",
@@ -176,6 +176,19 @@
       "button_label": "Status",
       "button_variant": "outline",
       "button_color": "blue"
+    },
+    {
+      "id": "schedule_test_fire",
+      "label": "[SCHEDULE] Test fire now",
+      "description": "Run the registered scheduled task synchronously, with the snapshotted settings. Verifies the cron pipeline end-to-end without waiting for the next tick.",
+      "button_label": "Test fire",
+      "button_variant": "outline",
+      "button_color": "blue",
+      "confirm": {
+        "required": true,
+        "title": "Fire scheduled task now?",
+        "message": "Runs the same action the cron will fire (with the snapshotted settings) right now. Useful to verify the pipeline works. May take many minutes depending on the action."
+      }
     },
     {
       "id": "apply_schedule",

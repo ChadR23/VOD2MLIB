@@ -1,223 +1,119 @@
-# VOD2MLIB — VOD → Media-Library .strm Generator (v1.8.2)
+# VOD2MLIB — Dispatcharr VOD → media library bridge
 
-Convert Dispatcharr's VOD catalogue into media-server-friendly `.strm` files (Plex, Jellyfin, Emby, Kodi) with optional NFO metadata, batch processing, and scheduled auto-rescan.
+A Dispatcharr plugin that converts your VOD catalogue into a folder of `.strm` files (with optional NFO metadata) that media servers like Jellyfin, Emby, Kodi, or ChannelsDVR can index and play.
 
 ## Credits
 
 - **Original author:** [shedunraid](https://github.com/shedunraid) — created v0.x–v1.3 ([upstream repo](https://github.com/shedunraid/VOD2MLIB)).
-- **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling, bug fixes, and submission to the official Dispatcharr Plugins repo. The upstream has been dormant since early 2026; this fork continues maintenance.
-- Distributed under the MIT License.
+- **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling, bug fixes, packaging for the [official Dispatcharr Plugins catalogue](https://github.com/Dispatcharr/Plugins). Upstream has been dormant since early 2026; this fork continues maintenance.
+- MIT License.
 
-## What's New in v1.8.2
+> **Plex users:** Plex does *not* play `.strm` files. Jellyfin and ChannelsDVR do. See [Plex compatibility](#plex-compatibility) below.
 
-- Settings-tab section headers switched from `── Paths & host ──` style to `[PATHS & HOSTS]`, `[MOVIES]`, `[SERIES]`, `[AUTO-RESCAN SCHEDULE]` — matching the bracketed `[SECTION]` prefix style used on the Actions tab. Both tabs now share visual conventions.
+---
 
-## What's New in v1.8.1
+## Install
 
-- **Full rescan now requires confirmation.** Clicking `[GENERATE] Full rescan` pops a dialog explaining the action walks every Movie and every Series, re-fetches episodes from the M3U source, and may take many minutes on large catalogues — and reminds you the cron does this nightly. Prevents accidental long-running clicks.
-- Description tightened to: *"Rescan then force regenerate Movies + Series. What cron fires."*
+1. **Map a host folder to `/VODS` in your Dispatcharr container.** Example Compose snippet:
+   ```yaml
+   volumes:
+     - /opt/dispatcharr-vods:/VODS
+   ```
+2. **Zip the plugin files** (`plugin.py`, `plugin.json`, `__init__.py`, `LICENSE`, `README.md`).
+3. **Dispatcharr → Plugins → Import** → upload the zip → enable the plugin.
 
-## What's New in v1.8.0
-
-Manifest-side UX pass — the most we can do without touching Dispatcharr's frontend.
-
-- **Settings tab now grouped.** Four `info`-type section dividers (`Paths & host`, `Movies`, `Series`, `Auto-rescan schedule`) split the previously flat field list into thematic blocks. The existing `About` block at the top stays.
-- **Action labels match the design's renaming map.** Sentence case throughout, with uppercase section prefixes:
-  - `Scan for VODs` → `[LIBRARY] Catalogue snapshot`
-  - `[Generate] Movie .strm files` → `[GENERATE] Movies`
-  - `[Generate] Series .strm files` → `[GENERATE] Series`
-  - `[Rescan & Generate] All` → `[GENERATE] Full rescan`
-  - `[Schedule] Apply` → `[SCHEDULE] Apply / Update`
-  - `[Schedule] Remove` → `[SCHEDULE] Unschedule`
-  - `[⚠️ Cleanup] Movies / Series` → `[⚠ DANGER] Clean up Movies / Series`
-- **Right-side button labels condensed** to single verbs: `Generate`, `Rescan all`, `Apply`, `Remove`, `Clean up`. Cleaner row visual.
-- **Rescan description trimmed** to fit one row at typical viewport widths.
-
-A full structural redesign (proper section headers as render-time UI, inline schedule status card, live-data meta chips) is out of scope for any plugin-side change — those require Dispatcharr frontend work. The current shape is the ceiling of what the plugin manifest alone can achieve.
-
-## What's New in v1.7.1
-
-- Action descriptions condensed to single-line so Run buttons stay right-aligned with their action title (Dispatcharr's UI drops buttons below when descriptions wrap).
-- `[Rescan] All (Movies + Series)` renamed to `[Rescan & Generate] All (Movies + Series)` to better reflect its dual nature: it both refreshes existing series and adds new ones.
-
-## What's New in v1.7
-
-UI clarity pass — the Actions panel was confusing in v1.6 (misleading descriptions, no confirm dialogs, mixed concerns). Fixes:
-
-- **Action labels now use `[Section]` prefixes** to visually group: `[Scan]`, `[Generate]`, `[Rescan]`, `[Schedule]`, `[⚠️ Cleanup]`. The flat list now reads top-to-bottom in workflow order.
-- **Confirm dialogs actually work** for destructive actions (`Cleanup Movies`, `Cleanup Series`, `Remove Schedule`). Earlier versions declared confirms in `plugin.json` but the runtime ignores manifest actions — now they live in the Python class where Dispatcharr reads them.
-- **Accurate descriptions.** Cleanup descriptions no longer claim to "remove all folders" — they correctly describe the v1.5+ selective behavior. Generate descriptions explain the skip semantics. Apply Schedule mentions the snapshot rule.
-- **`Rescan All` now forces `Refresh Existing Series` ON** regardless of the saved setting. The action's name promised rescan; the implementation now matches. The global `Refresh Existing Series` setting still applies to the individual `Generate Series` action for fast manual iteration.
-- **`Apply Schedule` warns** when you schedule `generate_series` with `Refresh Existing Series` OFF — the cron would silently fail to pick up new episodes. The warning appears in both the toast and the log.
-- **Buttons now have colors and labels** — Generate (green filled), Rescan (teal filled), Cleanup (red filled with confirm), Schedule status/apply (blue outline), Remove Schedule (orange outline with confirm).
-- **New `About` info field** at the top of Settings explaining the workflow.
-
-## What's New in v1.6
-
-- **Rescan-friendly series processing.** Series no longer skip wholesale once their folder exists — episodes are checked individually and only missing `.strm` files are written. New episodes added upstream are picked up on the next run.
-- **New setting: `Refresh Existing Series`** (boolean, default off). When ON, the plugin re-fetches the episode list from the M3U source for every series and re-evaluates already-processed series. Turn this ON before clicking **Apply Schedule** so cron rescans actually find new content.
-- **`tvshow.nfo` refresh:** with `Refresh Existing Series` ON, the plugin re-writes `tvshow.nfo` so metadata edits (plot, genre) propagate.
-- **Cleaner result messages**: per-series log now shows `+3 new episodes` or `up-to-date (24 episodes on disk)`. Run summary differentiates "series with new content" vs "series up-to-date".
-- **Fault tolerance**: the M3U re-fetch (which talks to your IPTV provider) is wrapped in try/except so a single failed series doesn't kill the rest of the batch.
-
-### Recommended schedule setup
-
-1. Turn ON **Refresh Existing Series**.
-2. Set **Batch Size (Series)** to **All series** (or a high number).
-3. Set **Auto-Rescan Schedule** (default `0 3 * * *` = 03:00 daily).
-4. Set **Scheduled Action** to **Full rescan (movies + series)**.
-5. Click **Apply Schedule**. The current settings are snapshotted into the periodic task.
-6. Verify via **Show Schedule Status**.
-
-The first scheduled run after upgrading to v1.6 may take longer than usual because every series is re-evaluated. Subsequent runs are fast — most series come back as "up-to-date" without writing files.
-
-## What's New in v1.5
-
-- **Bug fixes:**
-  - Folder names no longer duplicate the year (e.g. `Aladdin (2026) (2026)` → `Aladdin (2026)`).
-  - Series `Batch Size` now actually limits how many series are processed (previously the limit was unreachable due to a thread-pool order bug).
-  - Episode lookup is now filtered at the database level rather than scanning the entire M3U episode table per series — large catalogues are dramatically faster.
-  - `_clean_title` no longer over-strips short uppercase prefixes from real titles like `AC-130`.
-  - `Scan for VODs` now reports unique movie/series counts, not duplicate-counted M3U relations.
-  - `generate_nfo` and `generate_series_nfo` toggles are now exposed in the Dispatcharr UI (previously rejected because of an invalid field type).
-- **Cleanup is now non-destructive:** `Clean Up Movies` / `Clean Up Series` only delete the `.strm` and `.nfo` files this plugin created. User-added files (subtitles, posters, extras) are preserved; folders are removed only if empty.
-- **Submission-ready:** added a `plugin.json` manifest with proper field types, button styling, and confirm dialogs.
-
-## What's New in v1.4
-
-- **Rescan All action**: One-click full rescan that runs scan + movies + series in sequence.
-- **Scheduled Auto-Rescan (cron)**: Register a periodic task using a standard 5-field cron expression (default `0 3 * * *` = daily at 3 AM). Uses `django-celery-beat`.
-- **Schedule manager actions**: `Apply Schedule`, `Remove Schedule`, `Show Schedule Status`.
-
-### Setting up the schedule
-
-1. Set **Auto-Rescan Schedule (cron)** to your desired expression (e.g. `0 3 * * *`).
-2. Set **Scheduled Action** to what you want it to run (default: full rescan).
-3. Click **Apply Schedule**. The plugin snapshots your *current* settings into the periodic task — if you later change `root_folder`, `dispatcharr_url`, batch sizes, or NFO toggles, click **Apply Schedule** again to refresh the snapshot.
-4. Use **Show Schedule Status** to verify the task is registered, see the cron expression, last run, and run count.
-5. **Remove Schedule** unregisters the periodic task.
-
-Requires `django-celery-beat` and a running Celery beat scheduler in your Dispatcharr deployment. If `django-celery-beat` isn't available, the manager actions log a clear message and you can fall back to a host-side cron job hitting the Dispatcharr plugin action API.
-
-## What's New in v1.1
-
-- **Batch Size Options**: Choose 10, 50, 100, 200, 500, or All movies
-- **Total Count Display**: Shows total VODs in database before processing
-- **Progress Logging**: Logs every 50th movie to avoid spam
-
-## Installation
-
-1. Map a host folder to `/VODS` in your Dispatcharr container (e.g. `-v /opt/dispatcharr-vods:/VODS`).
-2. Zip the `plugin.py`, `plugin.json`, `__init__.py`, `LICENSE`, and `README.md` files.
-3. Dispatcharr → Plugins → Import → upload the zip → enable the plugin.
+Requires Dispatcharr **v0.24.0** or later. The auto-rescan feature additionally needs `django-celery-beat` (Dispatcharr ships with it).
 
 ## Settings
 
-- **Root Folder for Movies / Series:** paths inside the container (default `/VODS/Movies` and `/VODS/Series`).
-- **Dispatcharr URL:** the externally-reachable URL of your Dispatcharr instance (NOT `localhost`). It's baked into every `.strm`, so it must resolve from your media server.
-- **Batch Size (Movies / Series):** how many to process per click. Start at 10 to verify, scale up.
-- **Generate Movie / Series NFO Files:** toggle metadata file creation.
-- **Auto-Rescan Schedule (cron) / Scheduled Action:** see "Setting up the schedule" below.
+The Settings tab is grouped into four sections:
 
-## Usage
+| Section | Field | What it does |
+|---|---|---|
+| **Paths & hosts** | Root Folder for Movies / Series | Paths inside the container (defaults `/VODS/Movies`, `/VODS/Series`) |
+|  | Dispatcharr URL | Externally-reachable URL of Dispatcharr (NOT `localhost`). Baked into every `.strm`. |
+| **Movies** | Batch Size | How many movies to process per click |
+|  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
+| **Series** | Batch Size (Series) | How many series to process per click |
+|  | Generate Series NFO Files | Toggle `tvshow.nfo` and per-episode `.nfo` |
+|  | Refresh Existing Series | Re-evaluate already-processed series for new episodes (cron-friendly) |
+| **Auto-rescan schedule** | Schedule (cron) | Standard 5-field expression. Default `0 3 * * *` (daily 03:00) |
+|  | Scheduled Action | What the cron fires (full rescan recommended) |
 
-### First Time
-1. Set Batch Size to **10**
-2. Click "Generate .strm Files"
-3. Verify 10 movies created correctly
-4. Test playback in media server
+## Workflow
 
-### Scale Up
-1. Set Batch Size to **50**
-2. Run again - processes next 50
-3. Keep increasing as comfort grows
+**First run.** Configure paths → click `[LIBRARY] Catalogue snapshot` to verify the plugin can see your VODs → click `[GENERATE] Movies` with Batch Size 10 → spot-check the output → scale up.
 
-### Process All
-1. Set Batch Size to **All**
-2. Run once - processes entire catalog
+**Scaling up.** Increase Batch Size, click again. Existing files are skipped, so each click only processes new ones.
 
-## Output Example
+**Auto-rescan.**
+1. Turn ON **Refresh Existing Series**.
+2. Set **Scheduled Action** to **Full rescan**.
+3. Click `[SCHEDULE] Apply / Update`.
+4. Verify with `[SCHEDULE] Show status` — last run / total runs populate after the first cron tick.
+5. Optional: click `[SCHEDULE] Test fire now` to immediately replay the scheduled action without waiting for the next cron tick.
 
-```
-============================================================
-VOD .strm Generator v1.1.0
-Action: generate
-============================================================
+The cron snapshots your settings at click-time. Re-click Apply after changing any setting to refresh the snapshot.
 
-Configuration:
-  Root Folder: /data/movies
-  Dispatcharr URL: http://192.168.99.11:9191
-  Batch Size: 10
+## Plex compatibility
 
-Scanning database...
-Total VODs in database: 1234
+Plex does **not** play `.strm` files (it can index them but the URL inside doesn't play). This is a long-standing Plex limitation, not a plugin bug. Workable paths:
 
-Querying movies for this batch...
-Processing 10 of 1234 movies
-Found 10 movies to process
+- **Jellyfin alongside Plex** — Jellyfin plays `.strm` natively. Run it in a container next to Plex, point both at the same library folder.
+- **ChannelsDVR's Personal Media** — works perfectly with our output (point CDVR at the Movies/Series root).
+- **Kodi** — works.
+- **Emby** — works.
 
-Root folder ready: /data/movies
+See [the Plex investigation in this repo's issues](https://github.com/R3XCHRIS/VOD2MLIB/issues) (TBD) for a longer write-up.
 
-Processing movies:
-------------------------------------------------------------
+## Troubleshooting
 
-[1/10] Avatar
-  Year: 2009
-  Folder: Avatar (2009)
-  UUID: abc-123-def
-  Stream ID: 1234567
-  ✓ Created: /data/movies/Avatar (2009)/Avatar (2009).strm
+**"Unknown action" error in the toast.** Dispatcharr cached an old version of the plugin module. `docker restart dispatcharr` clears it. Toggling enable/disable on the plugin also forces a reload.
 
-... (details for other movies) ...
+**The Run button drops below the action title instead of right-aligning.** That's Dispatcharr's UI flex-wrap when the description spans 2+ lines. We keep descriptions single-line to avoid this; if it happens again, the description is too long for your viewport.
 
-============================================================
-SUMMARY:
-  Total in DB:  1234
-  Processed:    10
-  Created:      10
-  Skipped:      0
-  Errors:       0
-============================================================
+**Cron task registered but didn't fire.** Check `[SCHEDULE] Show status` — `last_run` should populate after the first scheduled tick. If still `never` after the expected time:
+- Verify Celery beat is running in your Dispatcharr deployment.
+- Check container logs for `core.scheduling Updated periodic task 'vod2mlib.auto_rescan'`.
+- Click `[SCHEDULE] Test fire now` to confirm the task itself works (proves it's a scheduling-layer issue, not a plugin issue).
 
-Complete! Check your media server to verify playback.
+**Schedule fires but no new files appear.** Most likely: `Refresh Existing Series` is OFF and your existing series already have folders, so the cron only adds *new* series. Toggle Refresh Existing ON, click Apply Schedule again to update the snapshot.
+
+**Folders named `Aladdin (2026) (2026)` (duplicate year).** This was a bug in v1.4 and earlier. Fixed in v1.5+ but pre-existing duplicate-year folders aren't auto-renamed. Run `[⚠ DANGER] Clean up Movies` once to remove them, then re-run `[GENERATE] Movies` to regenerate cleanly. (Cleanup deletes only `.strm`/`.nfo` — user-added subtitles/posters survive.)
+
+**Generate Series fails for some series.** The summary lists the failed series names with their errors. Common causes: M3U upstream timeout, malformed episode metadata. The plugin continues with the rest of the batch.
+
+**`localhost`/`127.0.0.1` in Dispatcharr URL.** The plugin refuses to write `.strm` with a localhost URL — your media server can't resolve it. Use the container's reachable IP/hostname.
+
+## Tests
+
+Pure-helper unit tests live in `tests/`. From the repo root:
+
+```bash
+python3 -m pytest tests/ -v
 ```
 
-## Folder Structure
+The tests don't need Django or a running Dispatcharr — they exercise `_clean_title`, `_strip_trailing_year`, `_sanitize_filename`, `_parse_cron`, `_extract_genres`, `_mask_url`, and the path-building helpers in isolation. 45 tests, ~50ms.
 
-```
-/data/movies/
-├── Avatar (2009)/
-│   └── Avatar (2009).strm
-├── Inception (2010)/
-│   └── Inception (2010).strm
-└── ...
-```
+## Changelog
 
-## Differences from v0.1
+**v1.9.0** — NFO titles no longer include the year (Kodi/Jellyfin scrapers prefer just the title). Shared language-prefix regex between `_clean_title` and `_extract_genres` (the AC-130 fix now covers categories too). `_generate_movies` now uses `query.iterator()` so the batch limit is honoured even when most candidates are already-done. Magic numbers promoted to class constants (`MAX_WORKERS`, `LOG_EVERY`, `MAX_FILENAME_LEN`). Class constants grouped at the top of the class. New `[SCHEDULE] Test fire now` action to replay the registered task synchronously. Failed series names now surface in the rescan summary. Cleaner toast on Rescan All. Logged Dispatcharr URL has its host masked. Schedule target validation derived from the manifest field options. New tests/ directory with 45 unit tests.
 
-| Feature | v0.1 | v1.1 |
-|---------|------|------|
-| Batch size | 5 only | 10, 50, 100, 200, 500, All |
-| Total count | No | Yes |
-| Progress | Every movie | Every 50th + first 10 |
-| Action name | "Test Mode" | "Generate .strm Files" |
+**v1.8.x** — Section dividers on Settings tab, action labels match the design's renaming map, full-rescan confirm dialog, `[BRACKET]` style headers.
 
-## Simple & Clean
+**v1.7.x** — UI clarity: button colors, confirm dialogs in Python class (manifest confirms were ignored by Dispatcharr's runtime), accurate descriptions, `Rescan all` forces refresh-existing.
 
-Based on working v0.1 code with minimal additions:
-- Same imports
-- Same structure
-- Same reliability
-- Just adds batch size options
+**v1.6** — Rescan-friendly: per-episode skip, optional M3U re-fetch, `Refresh Existing Series` toggle. Schedule rescans now actually pick up new episodes.
 
-## Next Steps
+**v1.5** — Submission-ready: `plugin.json` manifest, MIT/attribution, `__init__.py`. Bug fixes: duplicate-year folders, AC-130 over-strip, batch-limit unreachable for series, episode query at DB level, `checkbox` → `boolean`, scan counts unique not relations. Cleanup is now non-destructive (only deletes plugin-created files; user files preserved).
 
-Once this works perfectly:
-- Add genre organization
-- Add incremental processing (skip existing)
-- Add progress notifications
-- Add more features
+**v1.4** — Cron-driven auto-rescan via `django-celery-beat`. New `Rescan All` action.
 
-But for now - keep it simple!
+**v1.3 and earlier** — see [shedunraid's upstream](https://github.com/shedunraid/VOD2MLIB) for the original v0.x–v1.3 history.
 
+## Architecture (for contributors)
 
+- The plugin is a single `plugin.py` declaring a `Plugin` class with `fields`, `actions`, and `run()` per Dispatcharr's plugin contract.
+- `plugin.json` is the manifest the [Dispatcharr/Plugins catalogue](https://github.com/Dispatcharr/Plugins) reads. Dispatcharr's runtime reads action metadata from the Python class — the JSON is for the catalogue and pre-enable preview.
+- Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`. The cron-fired task is a module-level `@shared_task` named `vod2mlib.scheduled_rescan` that constructs a fresh `Plugin()` and dispatches.
+- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh.

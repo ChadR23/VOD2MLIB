@@ -1,0 +1,8 @@
+# VOD2MLIB has no external Python dependencies of its own.
+# It relies on packages already provided by the Dispatcharr container:
+#   - Django (for apps.vod.models, apps.vod.tasks)
+#   - django-celery-beat (optional; required only for the auto-rescan schedule)
+#   - celery (optional; same)
+#
+# For local development of the test suite:
+#   pip install pytest
