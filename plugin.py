@@ -1,8 +1,8 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.12.0 — schedule timezone setting (so '0 3 * * *' fires at local
-          time, not UTC); help_url for docs link on the plugin tile
+v1.13.0 — refresh existing .strm URLs after changing Dispatcharr URL
+          setting; preserve user .nfo edits in refresh mode
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -20,7 +20,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.12.0"
+    version = "1.13.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
