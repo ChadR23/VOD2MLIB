@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -72,6 +72,13 @@
       "help_text": "Create .nfo metadata files alongside each movie .strm."
     },
     {
+      "id": "refresh_existing_movies",
+      "label": "Refresh Existing Movies (URL refresh)",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Rewrite .strm files that already exist on disk so they pick up the current Dispatcharr URL. Use this after changing 'Dispatcharr URL (REQUIRED)' to fix stale addresses in already-generated files. .nfo files are only written when missing, so your edits are preserved. Off = skip movies already on disk (default, fast). On = also rewrite their .strm; in this mode 'Batch Size' caps total writes (new + refreshed) so you can pace a large refresh across multiple runs."
+    },
+    {
       "id": "nest_movies_by_category",
       "label": "Nest Movies by Category",
       "type": "boolean",
@@ -110,7 +117,7 @@
       "label": "Refresh Existing Series (rescan-friendly)",
       "type": "boolean",
       "default": false,
-      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream. Off = fast manual iteration (skip done series); On = scan everything for new content. Turn ON before clicking Apply Schedule for cron rescans of target 'generate_series'. Note: 'rescan_all' forces this ON regardless."
+      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off = fast manual iteration (skip done series); On = scan everything for new content and refresh existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target 'generate_series'. Note: 'rescan_all' forces this ON regardless."
     },
     {
       "id": "nest_series_by_category",
@@ -166,7 +173,7 @@
     {
       "id": "generate_movies",
       "label": "[GENERATE] Movies",
-      "description": "Process movies per Batch Size. Existing .strm files are skipped.",
+      "description": "Process movies per Batch Size. Existing .strm files are skipped unless 'Refresh Existing Movies' is ON.",
       "button_label": "Generate",
       "button_variant": "filled",
       "button_color": "green"

@@ -431,6 +431,7 @@ class Plugin:
         dispatcharr_url = (settings.get("dispatcharr_url") or "").rstrip("/")
         batch_size = settings.get("batch_size") or "250"
         generate_nfo = settings.get("generate_nfo", True)
+        refresh_existing = bool(settings.get("refresh_existing_movies", False))
         nest_by_cat = bool(settings.get("nest_movies_by_category", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
@@ -443,6 +444,7 @@ class Plugin:
             "Dispatcharr URL": self._mask_url(dispatcharr_url),
             "Batch Size": batch_size,
             "Generate NFO": "Yes" if generate_nfo else "No",
+            "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
         })
 
@@ -469,6 +471,7 @@ class Plugin:
             return {"status": "error", "message": f"Folder creation error: {e}"}
 
         created_strm = 0
+        refreshed_strm = 0
         created_nfo = 0
         skipped = 0
         errors = 0
@@ -485,42 +488,60 @@ class Plugin:
                 movie, root_folder, cat_name, nest_by_cat,
             )
             strm_path = os.path.join(movie_folder, strm_filename)
+            is_existing = os.path.exists(strm_path)
 
-            if os.path.exists(strm_path):
+            if is_existing and not refresh_existing:
                 skipped += 1
                 continue
 
             proxy_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
 
-            log_this = (created_strm + 1) % self.LOG_EVERY == 1 or created_strm < self.LOG_FIRST_N
+            written = created_strm + refreshed_strm
+            log_this = (written + 1) % self.LOG_EVERY == 1 or written < self.LOG_FIRST_N
+            verb = "refreshed" if is_existing else "created"
             if log_this:
                 logger.info("")
-                logger.info("[%d created / %d scanned] %s (%s)", created_strm + 1, scanned, movie_name, year or "—")
+                logger.info("[%d %s / %d scanned] %s (%s)", written + 1, verb, scanned, movie_name, year or "—")
 
             try:
                 os.makedirs(movie_folder, exist_ok=True)
                 with open(strm_path, 'w', encoding='utf-8') as f:
                     f.write(proxy_url)
-                created_strm += 1
+                if is_existing:
+                    refreshed_strm += 1
+                else:
+                    created_strm += 1
 
+                wrote_nfo = False
                 if generate_nfo:
                     nfo_filename = strm_filename.replace('.strm', '.nfo')
                     nfo_path = os.path.join(movie_folder, nfo_filename)
-                    category_name = relation.category.name if relation.category else ""
-                    with open(nfo_path, 'w', encoding='utf-8') as f:
-                        f.write(self._generate_nfo(movie, category_name))
-                    created_nfo += 1
+                    if not os.path.exists(nfo_path):
+                        category_name = relation.category.name if relation.category else ""
+                        with open(nfo_path, 'w', encoding='utf-8') as f:
+                            f.write(self._generate_nfo(movie, category_name))
+                        created_nfo += 1
+                        wrote_nfo = True
 
                 if log_this:
-                    logger.info("  ✓ wrote .strm%s", " + .nfo" if generate_nfo else "")
+                    logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
             except OSError as e:
                 logger.error("  ✗ %s: %s", movie_name, e)
                 errors += 1
 
-            if batch_size != "all" and created_strm >= target_batch:
-                logger.info("")
-                logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
-                break
+            if batch_size != "all":
+                limit_hit = (
+                    (refreshed_strm + created_strm) >= target_batch
+                    if refresh_existing
+                    else created_strm >= target_batch
+                )
+                if limit_hit:
+                    logger.info("")
+                    if refresh_existing:
+                        logger.info("Batch complete: %d new + %d refreshed .strm (scanned %d).", created_strm, refreshed_strm, scanned)
+                    else:
+                        logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
+                    break
 
         logger.info("")
         logger.info("=" * 60)
@@ -529,12 +550,16 @@ class Plugin:
         logger.info("  Scanned:         %d", scanned)
         logger.info("  Already on disk: %d", skipped)
         logger.info("  .strm created:   %d", created_strm)
+        if refresh_existing:
+            logger.info("  .strm refreshed: %d", refreshed_strm)
         if generate_nfo:
             logger.info("  .nfo created:    %d", created_nfo)
         logger.info("  Errors:          %d", errors)
         logger.info("=" * 60)
 
         summary_msg = f"Wrote {created_strm} new .strm files"
+        if refresh_existing and refreshed_strm:
+            summary_msg += f", refreshed {refreshed_strm}"
         if generate_nfo and created_nfo:
             summary_msg += f" + {created_nfo} .nfo"
         if skipped:
@@ -546,6 +571,7 @@ class Plugin:
             "total_in_db": total_count,
             "scanned": scanned,
             "created_strm": created_strm,
+            "refreshed_strm": refreshed_strm,
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
             "errors": errors,
@@ -670,6 +696,7 @@ class Plugin:
             }
 
         created_strm = 0
+        refreshed_strm = 0
         created_nfo = 0
         errors = 0
         series_created = 0
@@ -710,6 +737,7 @@ class Plugin:
                 elif result.get("created"):
                     series_created += 1
                     created_strm += result["episodes"]
+                    refreshed_strm += result.get("refreshed", 0)
                     created_nfo += result["nfo_files"]
                 if "error" in result:
                     errors += 1
@@ -722,6 +750,8 @@ class Plugin:
         logger.info("  Series with new content: %d", series_created)
         logger.info("  Series up-to-date:       %d", series_uptodate)
         logger.info("  New episode .strm files: %d", created_strm)
+        if refresh_existing:
+            logger.info("  Refreshed episode URLs:  %d", refreshed_strm)
         if generate_nfo:
             logger.info("  New NFO files:           %d", created_nfo)
         logger.info("  Errors:                  %d", errors)
@@ -731,6 +761,8 @@ class Plugin:
             summary_msg = f"All {series_uptodate} evaluated series already up-to-date — no new episodes."
         else:
             summary_msg = f"Wrote {created_strm} new episodes across {series_created} series"
+            if refresh_existing and refreshed_strm:
+                summary_msg += f", refreshed {refreshed_strm} episode URL{'s' if refreshed_strm != 1 else ''}"
             if series_uptodate:
                 summary_msg += f" ({series_uptodate} already up-to-date)"
             if generate_nfo and created_nfo:
@@ -750,6 +782,7 @@ class Plugin:
             "series_processed": series_created,
             "series_uptodate": series_uptodate,
             "episodes_created": created_strm,
+            "episodes_refreshed": refreshed_strm,
             "nfo_created": created_nfo if generate_nfo else 0,
             "errors": errors,
             "failures": failures,
@@ -811,11 +844,12 @@ class Plugin:
             os.makedirs(series_folder, exist_ok=True)
 
             new_episodes = 0
+            refreshed_episodes = 0
             new_nfo = 0
 
             if generate_nfo:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
-                if refresh_existing or not os.path.isfile(tvshow_nfo_path):
+                if not os.path.isfile(tvshow_nfo_path):
                     category_name = series_rel.category.name if series_rel.category else ""
                     tvshow_content = self._generate_tvshow_nfo(series, category_name)
                     with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
@@ -839,14 +873,18 @@ class Plugin:
                 filename = self._sanitize_filename(filename)
 
                 strm_path = os.path.join(season_folder, f"{filename}.strm")
-                if os.path.isfile(strm_path):
+                is_existing = os.path.isfile(strm_path)
+                if is_existing and not refresh_existing:
                     continue
 
                 os.makedirs(season_folder, exist_ok=True)
                 proxy_url = f"{dispatcharr_url}/proxy/vod/episode/{episode.uuid}?stream_id={episode_rel.stream_id}"
                 with open(strm_path, 'w', encoding='utf-8') as f:
                     f.write(proxy_url)
-                new_episodes += 1
+                if is_existing:
+                    refreshed_episodes += 1
+                else:
+                    new_episodes += 1
 
                 if generate_nfo:
                     nfo_path = os.path.join(season_folder, f"{filename}.nfo")
@@ -855,23 +893,32 @@ class Plugin:
                             f.write(self._generate_episode_nfo(episode))
                         new_nfo += 1
 
-            if new_episodes == 0:
+            if new_episodes == 0 and refreshed_episodes == 0:
                 return {
                     "created": False,
                     "uptodate": True,
                     "series_name": series_name,
                     "episodes": 0,
+                    "refreshed": 0,
                     "nfo_files": new_nfo,
                     "message": f"{series_name} - up-to-date ({episode_count} episodes on disk)",
                 }
+
+            if new_episodes > 0:
+                msg = f"{series_name} - +{new_episodes} new episode{'s' if new_episodes != 1 else ''}"
+                if refreshed_episodes:
+                    msg += f", {refreshed_episodes} refreshed"
+            else:
+                msg = f"{series_name} - refreshed {refreshed_episodes} episode URL{'s' if refreshed_episodes != 1 else ''}"
 
             return {
                 "created": True,
                 "uptodate": False,
                 "series_name": series_name,
                 "episodes": new_episodes,
+                "refreshed": refreshed_episodes,
                 "nfo_files": new_nfo,
-                "message": f"{series_name} - +{new_episodes} new episode{'s' if new_episodes != 1 else ''}",
+                "message": msg,
             }
 
         except Exception as e:
@@ -1350,12 +1397,12 @@ class Plugin:
     def _rescan_all(self, settings: Dict[str, Any], logger):
         """Combined scan + generate movies + generate series. Used by the cron schedule.
 
-        Always runs the series step with refresh_existing forced ON regardless of
-        the saved setting, so cron rescans (and manual Rescan All clicks) reliably
-        pick up new episodes for already-processed series. Movies are unaffected
-        (they're idempotent at the .strm-file level already).
+        Forces both refresh_existing_movies and refresh_existing ON regardless of
+        the saved settings, so cron rescans (and manual Rescan All clicks) reliably
+        pick up new content AND rewrite existing .strm files so URL changes
+        propagate. Existing .nfo files are preserved either way.
         """
-        logger.info("Combined rescan: scan + movies + series (Refresh Existing forced ON for series)")
+        logger.info("Combined rescan: scan + movies + series (Refresh Existing forced ON)")
         logger.info("")
 
         scan = self._scan_all_vods(settings, logger)
@@ -1364,9 +1411,10 @@ class Plugin:
 
         logger.info("")
         logger.info("=" * 60)
-        logger.info("Rescan: movies")
+        logger.info("Rescan: movies  (refresh_existing_movies=True)")
         logger.info("=" * 60)
-        movies = self._generate_movies(settings, logger)
+        movie_settings = {**settings, "refresh_existing_movies": True}
+        movies = self._generate_movies(movie_settings, logger)
 
         logger.info("")
         logger.info("=" * 60)
@@ -1379,17 +1427,29 @@ class Plugin:
         s = series if isinstance(series, dict) else {}
 
         movie_strm = m.get("created_strm", 0)
+        movie_refreshed = m.get("refreshed_strm", 0)
         movie_skipped = m.get("skipped", 0)
         ep_new = s.get("episodes_created", 0)
+        ep_refreshed = s.get("episodes_refreshed", 0)
         sc_new = s.get("series_processed", 0)
         sc_uptodate = s.get("series_uptodate", 0)
         total_errors = m.get("errors", 0) + s.get("errors", 0)
 
+        movie_extra = ""
+        if movie_refreshed:
+            movie_extra = f", {movie_refreshed} refreshed"
+        elif movie_skipped:
+            movie_extra = f" ({movie_skipped} on disk)"
+
+        series_extra = ""
+        if ep_refreshed:
+            series_extra = f", {ep_refreshed} refreshed"
+        if sc_uptodate:
+            series_extra += f" ({sc_uptodate} up-to-date)"
+
         message = (
-            f"Rescan complete. Movies: {movie_strm} new"
-            f"{f' ({movie_skipped} on disk)' if movie_skipped else ''}. "
-            f"Series: {ep_new} new episodes across {sc_new} series"
-            f"{f' ({sc_uptodate} up-to-date)' if sc_uptodate else ''}."
+            f"Rescan complete. Movies: {movie_strm} new{movie_extra}. "
+            f"Series: {ep_new} new episodes across {sc_new} series{series_extra}."
         )
         if total_errors:
             message += f" {total_errors} errors — see logs."
