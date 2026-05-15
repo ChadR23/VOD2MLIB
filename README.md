@@ -11,13 +11,25 @@
 </p>
 
 > [!WARNING]
-> ## ⚠ Scheduled rescans rely on the `dvr` Celery queue
+> ## ⚠ Use the `:dev` Dispatcharr image until the next tagged release
 >
-> Dispatcharr's default Celery worker doesn't register plugin `@shared_task` decorators reliably — plugins live outside `INSTALLED_APPS`, so neither autodiscovery nor the upstream hotfix succeeds in that worker process. As of v1.14.2, this plugin routes its scheduled task (and `[SCHEDULE] Test fire now`) to the `dvr` queue instead, because Dispatcharr's `dvr` worker DOES end up with plugin tasks registered. The default DVR worker uses a thread pool with concurrency 20, so co-tenanting a nightly rescan there has no practical impact on DVR recording capacity.
+> This plugin's scheduled rescan depends on an upstream Dispatcharr fix that is merged into the `dev` branch but predates the current `:latest` image:
 >
-> Tracked upstream at [Dispatcharr/Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244); fix open as [Dispatcharr/Dispatcharr#1245](https://github.com/Dispatcharr/Dispatcharr/pull/1245). Once the default worker properly registers plugin tasks in a tagged Dispatcharr release, this routing can be removed and `min_dispatcharr_version` in `plugin.json` will be bumped.
+> - **Scheduled tasks need [Dispatcharr/Dispatcharr#1245](https://github.com/Dispatcharr/Dispatcharr/pull/1245)** to register plugin `@shared_task` decorators with Celery workers. Without it, beat dispatches the rescan and the default worker rejects it with `Received unregistered task`. v1.14.2 ships a `queue="dvr"` workaround that keeps the rescan working on `:latest` by routing to a worker that does end up with plugin tasks registered (DVR's thread pool, concurrency 20 — no practical impact on actual DVR recording capacity). `:dev` removes the need for that routing entirely.
 >
-> **If you set up your schedule on v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading — that rewrites the stored task to route via the `dvr` queue. Without that re-apply, beat will keep dispatching to the default queue (where the worker rejects the task with `unregistered task`) and `[SCHEDULE] Show status` will misleadingly report `total_run_count` increasing because that field is incremented on dispatch, not on successful execution.
+> Use the `:dev` image until the next tagged Dispatcharr release ships the fix:
+>
+> ```yaml
+> # docker-compose.yml
+> services:
+>   dispatcharr:
+>     image: ghcr.io/dispatcharr/dispatcharr:dev
+>     # ...rest of your config
+> ```
+>
+> Once a stable release ships #1245, this warning will be removed and `min_dispatcharr_version` in `plugin.json` will be bumped accordingly.
+>
+> **If you set up your schedule on v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading to v1.14.2+ so the stored task gets the `queue="dvr"` routing. Without that re-apply, beat will keep dispatching to the default queue (where the worker rejects the task with `unregistered task`) and `[SCHEDULE] Show status` will misleadingly report `total_run_count` increasing because that field is incremented on dispatch, not on successful execution.
 >
 > Manual generate / scan / cleanup actions are unaffected — they run synchronously in the uwsgi process and don't depend on Celery worker registration.
 
