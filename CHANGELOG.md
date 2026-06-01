@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.15.0 — media-server-friendliness pass
+
+Three asks from Discord community testers in May 2026, all landed together:
+
+- **Folder names are now scraper-friendly.** Provider VOD names like `Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)` previously became a folder of the same shape, which ChannelsDVR's personal-media scraper fails to match. New `_extract_clean_name_and_year` helper truncates at the *first* `(YYYY)` (discarding the trailing junk) and strips common quality / encoding tokens (`4K`, `UHD`, `FHD`, `HD`, `SD`, `HDR`, `HEVC`, `H.264/265`, `1080p`, `720p`, `2160p`, `BluRay`, `BDRip`, `DVDRip`, `WEB-DL`, `HDTV`, `REMUX`). Result for the example: `Cool Hand Luke (1967)/`. Thanks to **sjsteve** for the report.
+- **New optional `{tmdb-NNN}` folder suffix.** New boolean setting `Append TMDB ID to folder names` (default OFF) appends Plex/ChannelsDVR-friendly `{tmdb-NNN}` to every Movies and Series folder when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media Movies agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches, the safest defence against name collisions and bad scrapes. **Caution:** flipping the toggle on an existing library creates the new folder names alongside the old ones — `[⚠ DANGER] Clean up` first or accept duplicates. Thanks again to **sjsteve**.
+- **NFOs now emit a `<thumb aspect="poster">` URL.** When Dispatcharr knows the artwork URL (via `movie.logo.url` / `series.logo.url`, typically a TMDB image), the plugin emits `<thumb aspect="poster">URL</thumb>` in `tvshow.nfo` and movie NFOs so media servers can render artwork without a TMDB roundtrip. Thanks to **edison085** for the report.
+
+No breaking changes. The simpler `_clean_title` / `_strip_trailing_year` helpers remain for NFO title generation (which wants gentler handling than folder naming).
+
 ## v1.14.3 — Show Status reflects Test fire + task completion
 
 The Celery task now bumps `PeriodicTask.last_run_at` on completion. Previously, that field was updated only by django-celery-beat at dispatch time, which had two consequences:

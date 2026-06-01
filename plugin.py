@@ -1,9 +1,9 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.14.3 — task bumps PeriodicTask.last_run_at on completion so Show
-          Status reflects manual Test fire runs (which bypass beat)
-          and the timestamp tracks true completion, not beat dispatch.
+v1.15.0 — folder-name cleanup (truncate at first year + strip 4K/HD/HDR
+          etc.), optional {tmdb-NNN} folder suffix for Plex/CDVR exact
+          matching, NFOs now emit a <thumb> poster URL.
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -21,7 +21,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.14.3"
+    version = "1.15.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -49,6 +49,22 @@ class Plugin:
     # Title cleaning. Whitespace required before the dash so 'AC-130' is preserved.
     _LANGUAGE_PREFIX_RE = re.compile(r'^[A-Z]{2,3}\s+-\s*')
     _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
+
+    # First-(YYYY) detector for v1.15.0+ folder-name cleanup. Some providers ship
+    # titles like "Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)" — ChannelsDVR
+    # scrapes off the folder name and fails to match those because of the
+    # trailing junk. Truncating at the first (YYYY) yields "Cool Hand Luke 4K"
+    # which then has quality tokens stripped to give "Cool Hand Luke".
+    _FIRST_YEAR_RE = re.compile(r'\((\d{4})\)')
+
+    # Quality / encoding tokens commonly stuffed into provider VOD titles.
+    # Stripped from folder names so media-server scrapers see a clean title.
+    # Word-boundary anchored so legitimate substrings ("Whiplash" etc.) survive.
+    _QUALITY_TOKEN_RE = re.compile(
+        r'\b(4K|UHD|FHD|HD|SD|HDR(?:10\+?)?|HEVC|H\.?26[45]|x26[45]|'
+        r'1080p|720p|2160p|480p|BluRay|BDRip|DVDRip|WEB-?DL|HDTV|REMUX)\b',
+        re.IGNORECASE,
+    )
 
     # Year-bucket category names like "2026 Movies", "1990s Series",
     # "2020 TV Shows" — these are navigation buckets from the IPTV provider's
@@ -128,6 +144,13 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally."
+        },
+        {
+            "id": "append_tmdb_id_to_folder",
+            "label": "Append TMDB ID to folder names",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches, which is the safest defence against name collisions and bad metadata scrapes. Off by default because flipping it on an existing library renames every folder — the plugin creates the new names alongside the old ones; you'd need to `[⚠ DANGER] Clean up` first or accept duplicates."
         },
         {
             "id": "_section_series",
@@ -397,29 +420,51 @@ class Plugin:
             return "Unassigned"
         return self._sanitize_filename(cat)
 
-    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False):
+    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the (folder_path, strm_filename, clean_name, year) for a movie.
 
         When nest=True the folder is wrapped in a category subfolder named
         by the raw M3U category (or 'Unassigned' if none).
+
+        When append_tmdb_id=True AND the movie has a tmdb_id, the folder name
+        gets a Plex/ChannelsDVR-friendly `{tmdb-NNN}` suffix for exact
+        metadata matching. The strm filename inside the folder is NOT
+        affected — only the folder name, since that's what scrapers read.
         """
         raw_name = movie.name or f"Unknown Movie {movie.id}"
-        clean_name = self._clean_title(raw_name)
-        clean_name, title_year = self._strip_trailing_year(clean_name)
+        clean_name, title_year = self._extract_clean_name_and_year(raw_name)
         year = movie.year or title_year
         safe = self._sanitize_filename(clean_name)
         if year:
-            folder_name = f"{safe} ({year})"
+            base_name = f"{safe} ({year})"
             strm_filename = f"{safe} ({year}).strm"
         else:
-            folder_name = safe
+            base_name = safe
             strm_filename = f"{safe}.strm"
+        folder_name = self._apply_tmdb_suffix(base_name, movie, append_tmdb_id)
         cat_segment = self._category_subfolder(category_name, nest)
         if cat_segment:
             folder_path = os.path.join(root_folder, cat_segment, folder_name)
         else:
             folder_path = os.path.join(root_folder, folder_name)
         return folder_path, strm_filename, clean_name, year
+
+    def _apply_tmdb_suffix(self, base_name: str, obj, append_tmdb_id: bool) -> str:
+        """Append `{tmdb-NNN}` to a folder base name when the toggle is on and
+        the object exposes a tmdb_id. Returns unchanged otherwise.
+
+        Plex's [Personal Media Movies] agent treats `{tmdb-N}` / `{imdb-ttN}`
+        as a forced-match override. ChannelsDVR's local-media scraper does the
+        same. Off by default since flipping the toggle changes existing folder
+        names — users would need to clean up the old folders or accept the new
+        ones living alongside.
+        """
+        if not append_tmdb_id:
+            return base_name
+        tmdb_id = (getattr(obj, "tmdb_id", "") or "").strip()
+        if not tmdb_id:
+            return base_name
+        return f"{base_name} {{tmdb-{tmdb_id}}}"
 
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
         """Generate movie .strm files according to batch size.
@@ -438,6 +483,7 @@ class Plugin:
         generate_nfo = settings.get("generate_nfo", True)
         refresh_existing = bool(refresh_urls)
         nest_by_cat = bool(settings.get("nest_movies_by_category", False))
+        append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -451,6 +497,7 @@ class Plugin:
             "Generate NFO": "Yes" if generate_nfo else "No",
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
+            "Append TMDB ID": "Yes" if append_tmdb_id else "No",
         })
 
         try:
@@ -490,7 +537,7 @@ class Plugin:
             movie = relation.movie
             cat_name = relation.category.name if relation.category else ""
             movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-                movie, root_folder, cat_name, nest_by_cat,
+                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id,
             )
             strm_path = os.path.join(movie_folder, strm_filename)
             is_existing = os.path.exists(strm_path)
@@ -582,18 +629,23 @@ class Plugin:
             "errors": errors,
         }
     
-    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False):
+    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
         When nest=True the folder is wrapped in a category subfolder named
         by the raw M3U category (or 'Unassigned' if none).
+
+        When append_tmdb_id=True AND the series has a tmdb_id, the folder name
+        gets a `{tmdb-NNN}` suffix for Plex/ChannelsDVR exact matching. See
+        `_apply_tmdb_suffix` for caveats around flipping the toggle on an
+        existing library.
         """
         raw_name = series.name or f"Unknown Series {series.id}"
-        clean_name = self._clean_title(raw_name)
-        clean_name, title_year = self._strip_trailing_year(clean_name)
+        clean_name, title_year = self._extract_clean_name_and_year(raw_name)
         year = series.year or title_year
         safe = self._sanitize_filename(clean_name)
-        folder_name = f"{safe} ({year})" if year else safe
+        base_name = f"{safe} ({year})" if year else safe
+        folder_name = self._apply_tmdb_suffix(base_name, series, append_tmdb_id)
         cat_segment = self._category_subfolder(category_name, nest)
         if cat_segment:
             return os.path.join(series_root, cat_segment, folder_name), clean_name, year
@@ -619,6 +671,7 @@ class Plugin:
         generate_nfo = settings.get("generate_series_nfo", True)
         refresh_existing = bool(settings.get("refresh_existing", False))
         nest_by_cat = bool(settings.get("nest_series_by_category", False))
+        append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -674,7 +727,7 @@ class Plugin:
             if not refresh_existing:
                 cat_name = series_rel.category.name if series_rel.category else ""
                 folder, _, _ = self._series_target_folder(
-                    series_rel.series, series_root, cat_name, nest_by_cat,
+                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id,
                 )
                 if self._series_already_processed(folder):
                     continue
@@ -722,6 +775,7 @@ class Plugin:
                     logger,
                     refresh_existing,
                     nest_by_cat,
+                    append_tmdb_id,
                 ): series_rel
                 for series_rel in to_process
             }
@@ -793,7 +847,7 @@ class Plugin:
             "failures": failures,
         }
     
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False):
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
@@ -810,7 +864,7 @@ class Plugin:
         series = series_rel.series
         cat_name = series_rel.category.name if series_rel.category else ""
         series_folder, series_name, _year = self._series_target_folder(
-            series, series_root, cat_name, nest_by_cat,
+            series, series_root, cat_name, nest_by_cat, append_tmdb_id,
         )
 
         try:
@@ -1171,6 +1225,44 @@ class Plugin:
         if not match:
             return title, None
         return self._TRAILING_YEAR_RE.sub('', title).rstrip(), int(match.group(1))
+
+    def _extract_clean_name_and_year(self, raw_name: str):
+        """Aggressive folder-name cleanup for movies & series.
+
+        Strips language prefix, truncates at the FIRST (YYYY) so trailing
+        provider junk (cast names, duplicate years, etc.) is discarded, then
+        strips quality / encoding tokens from the surviving prefix. Returns
+        (clean_name, year) where year is an int if a (YYYY) was found.
+
+        Examples:
+            "Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)" → ("Cool Hand Luke", 1967)
+            "EN - The Matrix (1999)"                     → ("The Matrix", 1999)
+            "Whiplash 1080p HEVC (2014)"                 → ("Whiplash", 2014)
+            "Avatar"                                     → ("Avatar", None)
+
+        Used by `_movie_target_paths` and `_series_target_folder`. The simpler
+        `_clean_title` / `_strip_trailing_year` helpers stay as-is for NFO
+        generation, which wants gentler handling.
+        """
+        if not raw_name:
+            # Preserve the falsy type contract used by _clean_title:
+            # "" stays "", None stays None. Callers always pre-coalesce
+            # the upstream name field so None never reaches us in practice.
+            return raw_name, None
+        # Language prefix first (same regex as _clean_title).
+        title = self._LANGUAGE_PREFIX_RE.sub('', raw_name).strip()
+        # Truncate at the first (YYYY) — everything after is provider noise.
+        match = self._FIRST_YEAR_RE.search(title)
+        year = None
+        if match:
+            year = int(match.group(1))
+            title = title[:match.start()]
+        # Strip quality tokens and collapse repeated whitespace.
+        title = self._QUALITY_TOKEN_RE.sub('', title)
+        title = re.sub(r'\s+', ' ', title).strip()
+        # Trim trailing punctuation left behind by token removal (e.g. "Title -").
+        title = title.rstrip(' -_.,;:').strip()
+        return title, year
     
     def _extract_genres(self, category_name: str) -> list:
         """Extract genre names from category name."""
@@ -1277,6 +1369,13 @@ class Plugin:
             xml_lines.append(f'    <imdbid>{self._xml_escape(imdb_id)}</imdbid>')
             xml_lines.append(f'    <uniqueid type="imdb">{self._xml_escape(imdb_id)}</uniqueid>')
 
+        # Emit poster URL when available so media servers can render artwork
+        # without scraping TMDB themselves. Dispatcharr exposes the provider's
+        # TMDB image via series.logo.url (typically image.tmdb.org/...).
+        poster_url = self._logo_url(series)
+        if poster_url:
+            xml_lines.append(f'    <thumb aspect="poster">{self._xml_escape(poster_url)}</thumb>')
+
         xml_lines.append('</tvshow>')
 
         return '\n'.join(xml_lines)
@@ -1364,10 +1463,36 @@ class Plugin:
             xml_lines.append(f'    <imdbid>{self._xml_escape(imdb_id)}</imdbid>')
             xml_lines.append(f'    <uniqueid type="imdb">{self._xml_escape(imdb_id)}</uniqueid>')
 
+        # Emit poster URL when available (Dispatcharr's movie.logo.url is
+        # typically a TMDB image URL). Saves the media server from doing a
+        # second roundtrip to TMDB just for artwork.
+        poster_url = self._logo_url(movie)
+        if poster_url:
+            xml_lines.append(f'    <thumb aspect="poster">{self._xml_escape(poster_url)}</thumb>')
+
         xml_lines.append('</movie>')
-        
+
         return '\n'.join(xml_lines)
-    
+
+    def _logo_url(self, obj) -> str:
+        """Best-effort extraction of an artwork URL from a Dispatcharr Movie /
+        Series object. Returns '' if no usable URL is present.
+
+        Dispatcharr's VOD models expose artwork via a `logo` FK to VODLogo,
+        whose `.url` is typically a TMDB image URL like
+        `https://image.tmdb.org/t/p/w600_and_h900_bestv2/<hash>.jpg`. We use
+        getattr defensively so the helper survives schema changes (e.g. a
+        future flat `logo_url` string field) and missing relations.
+        """
+        try:
+            logo = getattr(obj, "logo", None)
+            if logo is None:
+                return ""
+            url = getattr(logo, "url", None) or (logo if isinstance(logo, str) else "")
+            return (url or "").strip()
+        except Exception:
+            return ""
+
     def _xml_escape(self, text: str) -> str:
         """Escape special XML characters."""
         if not text:

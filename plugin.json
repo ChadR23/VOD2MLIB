@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.14.3",
+  "version": "1.15.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -77,6 +77,13 @@
       "type": "boolean",
       "default": false,
       "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally."
+    },
+    {
+      "id": "append_tmdb_id_to_folder",
+      "label": "Append TMDB ID to folder names",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches. Off by default because flipping it on an existing library renames every folder."
     },
     {
       "id": "_section_series",

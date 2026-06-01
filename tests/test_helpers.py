@@ -773,3 +773,250 @@ class TestWalkAndCleanup:
         # Root must still exist
         assert tmp_path.exists()
         assert r["removed_dirs"] == 1  # only the Aladdin folder, not the root
+
+
+# ---------- _extract_clean_name_and_year (v1.15.0) ----------
+
+class TestExtractCleanNameAndYear:
+    """The aggressive cleanup used for folder names. Truncates at the first
+    (YYYY), strips quality tokens, leaves the gentler _clean_title /
+    _strip_trailing_year helpers untouched for NFO title generation."""
+
+    def test_sjsteve_discord_example_cool_hand_luke(self, p):
+        # The exact example from the Discord report: trailing cast + duplicate
+        # year defeat ChannelsDVR's metadata scraper. Expected output is the
+        # clean canonical title with the first (YYYY) only.
+        title, year = p._extract_clean_name_and_year("Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)")
+        assert title == "Cool Hand Luke"
+        assert year == 1967
+
+    def test_simple_year_in_parens(self, p):
+        title, year = p._extract_clean_name_and_year("The Matrix (1999)")
+        assert title == "The Matrix"
+        assert year == 1999
+
+    def test_language_prefix_stripped(self, p):
+        title, year = p._extract_clean_name_and_year("EN - The Matrix (1999)")
+        assert title == "The Matrix"
+        assert year == 1999
+
+    def test_quality_token_stripped(self, p):
+        # 1080p / HEVC inside the title — stripped after year truncation.
+        title, year = p._extract_clean_name_and_year("Whiplash 1080p HEVC (2014)")
+        assert title == "Whiplash"
+        assert year == 2014
+
+    def test_quality_token_4k_uhd_hdr(self, p):
+        title, year = p._extract_clean_name_and_year("Dune 4K UHD HDR (2021)")
+        assert title == "Dune"
+        assert year == 2021
+
+    def test_first_year_wins_when_two_present(self, p):
+        # Sanity for the truncate-at-first-year rule: garbage AND a second year.
+        title, year = p._extract_clean_name_and_year("Title (1995) extra (2000)")
+        assert title == "Title"
+        assert year == 1995
+
+    def test_no_year_anywhere(self, p):
+        title, year = p._extract_clean_name_and_year("Avatar")
+        assert title == "Avatar"
+        assert year is None
+
+    def test_only_quality_tokens_no_year(self, p):
+        title, year = p._extract_clean_name_and_year("Inception 4K HEVC")
+        assert title == "Inception"
+        assert year is None
+
+    def test_empty_input(self, p):
+        assert p._extract_clean_name_and_year("") == ("", None)
+        assert p._extract_clean_name_and_year(None) == (None, None)
+
+    def test_legit_substrings_preserved(self, p):
+        # 'HD' must not eat 'Indiana' / 'Headhunter' / etc — boundary anchored.
+        title, year = p._extract_clean_name_and_year("Indiana Jones (1981)")
+        assert title == "Indiana Jones"
+        assert year == 1981
+        title, _ = p._extract_clean_name_and_year("Headhunter")
+        assert title == "Headhunter"
+
+    def test_ac_130_preserved(self, p):
+        # The original _clean_title carve-out — AC-130 / MI-5 must not be
+        # treated as a language prefix.
+        title, year = p._extract_clean_name_and_year("AC-130 (2018)")
+        assert title == "AC-130"
+        assert year == 2018
+
+    def test_trailing_separator_stripped(self, p):
+        # Quality token removal can leave " - " or " ," dangling — clean it.
+        title, year = p._extract_clean_name_and_year("Title 4K - (2020)")
+        assert title == "Title"
+        assert year == 2020
+
+
+# ---------- _apply_tmdb_suffix (v1.15.0) ----------
+
+class TestApplyTmdbSuffix:
+    def test_off_returns_unchanged(self, p):
+        class M:
+            tmdb_id = "378"
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), False) == "Cool Hand Luke (1967)"
+
+    def test_on_with_id_appends_suffix(self, p):
+        class M:
+            tmdb_id = "378"
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967) {tmdb-378}"
+
+    def test_on_without_id_returns_unchanged(self, p):
+        # No garbage suffix when the TMDB ID is missing.
+        class M:
+            tmdb_id = ""
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
+
+    def test_on_with_whitespace_id_returns_unchanged(self, p):
+        class M:
+            tmdb_id = "   "
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
+
+    def test_on_with_none_obj_attr_returns_unchanged(self, p):
+        # Defensive: getattr default catches a missing attribute.
+        class M:
+            pass
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
+
+
+# ---------- _logo_url (v1.15.0) ----------
+
+class TestLogoUrl:
+    def test_returns_url_from_fk_logo(self, p):
+        # The shape Dispatcharr's VODLogo presents: a related model with .url.
+        class L:
+            url = "https://image.tmdb.org/t/p/w600/abc.jpg"
+        class M:
+            logo = L()
+        assert p._logo_url(M()) == "https://image.tmdb.org/t/p/w600/abc.jpg"
+
+    def test_returns_empty_when_no_logo(self, p):
+        class M:
+            logo = None
+        assert p._logo_url(M()) == ""
+
+    def test_returns_empty_when_missing_attr(self, p):
+        class M:
+            pass
+        assert p._logo_url(M()) == ""
+
+    def test_returns_empty_when_logo_url_blank(self, p):
+        class L:
+            url = "   "
+        class M:
+            logo = L()
+        assert p._logo_url(M()) == ""
+
+    def test_handles_plain_string_logo(self, p):
+        # Defensive: if a future schema swaps the FK for a flat string column,
+        # the helper still picks up the URL.
+        class M:
+            logo = "https://image.tmdb.org/t/p/w400/xyz.jpg"
+        assert p._logo_url(M()) == "https://image.tmdb.org/t/p/w400/xyz.jpg"
+
+
+# ---------- folder paths with append_tmdb_id (v1.15.0) ----------
+
+class TestMovieTargetPathsWithTmdbSuffix:
+    class _M:
+        id = 1
+        uuid = "abc"
+        name = "Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)"
+        year = None
+        tmdb_id = "378"
+
+    def test_dirty_provider_name_cleaned_to_canonical_folder(self, p):
+        # Without the toggle, just the cleanup applies.
+        folder, strm, name, year = p._movie_target_paths(self._M(), "/VODS/Movies")
+        assert folder == "/VODS/Movies/Cool Hand Luke (1967)"
+        assert strm == "Cool Hand Luke (1967).strm"
+        assert name == "Cool Hand Luke"
+        assert year == 1967
+
+    def test_tmdb_suffix_appended_when_toggle_on(self, p):
+        folder, strm, name, year = p._movie_target_paths(
+            self._M(), "/VODS/Movies", category_name="", nest=False, append_tmdb_id=True,
+        )
+        assert folder == "/VODS/Movies/Cool Hand Luke (1967) {tmdb-378}"
+        # The strm filename inside the folder is unaffected — scrapers only
+        # care about the folder name.
+        assert strm == "Cool Hand Luke (1967).strm"
+
+    def test_tmdb_suffix_skipped_when_id_missing(self, p):
+        class M:
+            id = 1; uuid = "x"; name = "Mystery"; year = None; tmdb_id = ""
+        folder, _, _, _ = p._movie_target_paths(M(), "/VODS/Movies", append_tmdb_id=True)
+        assert folder == "/VODS/Movies/Mystery"
+
+
+class TestSeriesTargetFolderWithTmdbSuffix:
+    class _S:
+        id = 1
+        uuid = "abc"
+        name = "Breaking Bad UHD (2008)"
+        year = None
+        tmdb_id = "1396"
+
+    def test_dirty_series_name_cleaned(self, p):
+        folder, name, year = p._series_target_folder(self._S(), "/VODS/Series")
+        assert folder == "/VODS/Series/Breaking Bad (2008)"
+        assert name == "Breaking Bad"
+        assert year == 2008
+
+    def test_tmdb_suffix_appended_when_toggle_on(self, p):
+        folder, _, _ = p._series_target_folder(
+            self._S(), "/VODS/Series", category_name="", nest=False, append_tmdb_id=True,
+        )
+        assert folder == "/VODS/Series/Breaking Bad (2008) {tmdb-1396}"
+
+
+# ---------- NFO emits <thumb> when logo URL present (v1.15.0) ----------
+
+class TestNfoThumbEmission:
+    def test_movie_nfo_emits_thumb_when_logo_present(self, p):
+        class L:
+            url = "https://image.tmdb.org/t/p/w600/abc.jpg"
+        class M:
+            name = "The Matrix"
+            year = 1999
+            description = ""
+            rating = ""
+            tmdb_id = "603"
+            imdb_id = ""
+            genre = ""
+            logo = L()
+        nfo = p._generate_nfo(M(), category_name="")
+        assert '<thumb aspect="poster">https://image.tmdb.org/t/p/w600/abc.jpg</thumb>' in nfo
+
+    def test_movie_nfo_omits_thumb_when_no_logo(self, p):
+        class M:
+            name = "The Matrix"
+            year = 1999
+            description = ""
+            rating = ""
+            tmdb_id = "603"
+            imdb_id = ""
+            genre = ""
+            logo = None
+        nfo = p._generate_nfo(M(), category_name="")
+        assert "<thumb" not in nfo
+
+    def test_tvshow_nfo_emits_thumb_when_logo_present(self, p):
+        class L:
+            url = "https://image.tmdb.org/t/p/w400/show.jpg"
+        class S:
+            name = "Breaking Bad"
+            year = 2008
+            description = ""
+            rating = ""
+            tmdb_id = "1396"
+            imdb_id = ""
+            genre = ""
+            logo = L()
+        nfo = p._generate_tvshow_nfo(S(), category_name="")
+        assert '<thumb aspect="poster">https://image.tmdb.org/t/p/w400/show.jpg</thumb>' in nfo

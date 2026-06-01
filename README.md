@@ -7,7 +7,7 @@
 <p align="center">A Dispatcharr plugin that turns your VOD catalogue into a folder of <code>.strm</code> files (with optional NFO metadata) that media servers — Jellyfin, Emby, Kodi, ChannelsDVR — can index and play.</p>
 
 <p align="center">
-  <i>v1.14.3 — slug <code>vod2mlib</code></i>
+  <i>v1.15.0 — slug <code>vod2mlib</code></i>
 </p>
 
 > **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. If you originally set up your schedule on **v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading so the stored task picks up the new routing.
@@ -122,6 +122,7 @@ The Settings tab is grouped into four sections:
 | **Movies** | Batch Size | How many movies to process per click |
 |  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
 |  | Nest Movies by Category | Wrap each movie folder inside a subfolder named by its M3U category (off by default; movies without a category go to `Unassigned/`) |
+|  | Append TMDB ID to folder names | Append `{tmdb-NNN}` to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex/CDVR honour this for forced exact metadata matches. Off by default; flipping creates new folder names alongside the old ones, so clean up first. |
 | **Series** | Batch Size (Series) | How many series to process per click |
 |  | Generate Series NFO Files | Toggle `tvshow.nfo` and per-episode `.nfo` |
 |  | Refresh Existing Series | Re-evaluate already-processed series for new episodes AND rewrite existing episode `.strm` URLs (cron-friendly). Preserves `tvshow.nfo` and episode `.nfo` edits. |
