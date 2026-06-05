@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -76,7 +76,14 @@
       "label": "Nest Movies by Category",
       "type": "boolean",
       "default": false,
-      "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally."
+      "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally — turn ON Dedupe Movies Across Categories below to suppress this for genre-overlap cases."
+    },
+    {
+      "id": "dedupe_movies_across_categories",
+      "label": "Dedupe Movies Across Categories",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream (e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Movies by Category` is OFF — multi-category movies already resolve to the same folder in that case. Use this when you want one folder per movie regardless of provider tagging."
     },
     {
       "id": "append_tmdb_id_to_folder",
@@ -124,7 +131,14 @@
       "label": "Nest Series by Category",
       "type": "boolean",
       "default": false,
-      "help_text": "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your provider organises series by genre. Series without a category go into a folder named 'Unassigned'. Same content with different categories gets separate folders intentionally."
+      "help_text": "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your provider organises series by genre. Series without a category go into a folder named 'Unassigned'. Same content with different categories gets separate folders intentionally — turn ON Dedupe Series Across Categories below to suppress this for genre-overlap cases."
+    },
+    {
+      "id": "dedupe_series_across_categories",
+      "label": "Dedupe Series Across Categories",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF."
     },
     {
       "id": "_section_schedule",

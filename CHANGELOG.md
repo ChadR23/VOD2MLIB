@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.15.1 — dedupe movies/series across categories
+
+Closes the first GitHub issue against this repo ([#1](https://github.com/R3XCHRIS/VOD2MLIB/issues/1), thanks **FCSO-byte**).
+
+When a provider tags one movie under multiple categories (e.g. `Action` AND `Sci-Fi`), Dispatcharr stores one `M3UMovieRelation` row per (movie × m3u_account × category). With `Nest Movies by Category` ON, each row was producing a different folder path — so the same `.strm` ended up duplicated across multiple category folders. The original intent (called out in the help text) was the 4K-vs-HD variant-stream case; the multi-genre case is a fair "shouldn't be the default" outcome.
+
+Two new opt-in toggles:
+
+- **`Dedupe Movies Across Categories`** (default OFF, in the `[MOVIES]` section). When ON *and* `Nest Movies by Category` is also ON, the plugin writes each movie's `.strm` under the *first* category only (alphabetical by category name, deterministic tiebreaker on relation `id`) and skips subsequent ones. No effect when nesting is OFF (multi-category rows already resolve to the same folder in that case, and the existence check skips them).
+- **`Dedupe Series Across Categories`** (default OFF, in the `[SERIES]` section). Mirror behaviour for series.
+
+Run summary surfaces a new `Deduped (multi-cat)` counter so the dedup activity is visible. The query gains an `ORDER BY category__name, id` only when the dedup toggle is on, so users not opting in pay no perf cost.
+
+The defaults preserve the existing variant-stream-friendly behaviour exactly; this is a purely additive feature for users who want one folder per title regardless of upstream tagging.
+
 ## v1.15.0 — media-server-friendliness pass
 
 Three asks from Discord community testers in May 2026, all landed together:

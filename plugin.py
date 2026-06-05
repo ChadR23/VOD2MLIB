@@ -1,9 +1,10 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.15.0 — folder-name cleanup (truncate at first year + strip 4K/HD/HDR
-          etc.), optional {tmdb-NNN} folder suffix for Plex/CDVR exact
-          matching, NFOs now emit a <thumb> poster URL.
+v1.15.1 — optional Dedupe Movies/Series Across Categories toggle:
+          when nesting is on and a title is tagged with multiple
+          categories upstream, only the first-encountered category
+          gets the folder (alphabetical). Closes issue #1.
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -21,7 +22,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.15.0"
+    version = "1.15.1"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -143,7 +144,14 @@ class Plugin:
             "label": "Nest Movies by Category",
             "type": "boolean",
             "default": False,
-            "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally."
+            "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally — turn ON Dedupe Movies Across Categories below to suppress this for genre-overlap cases."
+        },
+        {
+            "id": "dedupe_movies_across_categories",
+            "label": "Dedupe Movies Across Categories",
+            "type": "boolean",
+            "default": False,
+            "help_text": "When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream (e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Movies by Category` is OFF — in that case multi-category movies already resolve to the same folder. Use this when you want one folder per movie regardless of provider tagging; your media server's genre tags still reflect every category via the NFO."
         },
         {
             "id": "append_tmdb_id_to_folder",
@@ -191,7 +199,14 @@ class Plugin:
             "label": "Nest Series by Category",
             "type": "boolean",
             "default": False,
-            "help_text": "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your provider organises series by genre. Series without a category go into a folder named 'Unassigned'. Same content with different categories gets separate folders intentionally."
+            "help_text": "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your provider organises series by genre. Series without a category go into a folder named 'Unassigned'. Same content with different categories gets separate folders intentionally — turn ON Dedupe Series Across Categories below to suppress this for genre-overlap cases."
+        },
+        {
+            "id": "dedupe_series_across_categories",
+            "label": "Dedupe Series Across Categories",
+            "type": "boolean",
+            "default": False,
+            "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF."
         },
         {
             "id": "_section_schedule",
@@ -483,6 +498,7 @@ class Plugin:
         generate_nfo = settings.get("generate_nfo", True)
         refresh_existing = bool(refresh_urls)
         nest_by_cat = bool(settings.get("nest_movies_by_category", False))
+        dedupe_across_cats = bool(settings.get("dedupe_movies_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
@@ -497,6 +513,7 @@ class Plugin:
             "Generate NFO": "Yes" if generate_nfo else "No",
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
+            "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Append TMDB ID": "Yes" if append_tmdb_id else "No",
         })
 
@@ -508,6 +525,12 @@ class Plugin:
 
         try:
             query = M3UMovieRelation.objects.select_related('movie', 'm3u_account', 'category')
+            if dedupe_across_cats:
+                # Deterministic "first category wins" requires a stable sort.
+                # Alphabetical by category name, then relation id as a tiebreaker.
+                # Only applied when the toggle is ON so we don't penalise normal
+                # iteration with an unnecessary ORDER BY on the relation table.
+                query = query.order_by('category__name', 'id')
             total_count = query.count()
             if total_count == 0:
                 return {"status": "ok", "message": "No movies found to process", "processed": 0}
@@ -526,8 +549,13 @@ class Plugin:
         refreshed_strm = 0
         created_nfo = 0
         skipped = 0
+        deduped = 0
         errors = 0
         scanned = 0
+
+        # seen-set is only used when dedupe is on; kept as None otherwise so the
+        # membership check short-circuits cheaply for everyone else.
+        seen_movie_uuids = set() if dedupe_across_cats else None
 
         logger.info("Processing movies:")
         logger.info("-" * 60)
@@ -535,6 +563,13 @@ class Plugin:
         for relation in query.iterator():
             scanned += 1
             movie = relation.movie
+            if seen_movie_uuids is not None:
+                if movie.uuid in seen_movie_uuids:
+                    # Same movie already written under an earlier-alphabetical
+                    # category. Skip — counts under `deduped` not `skipped`.
+                    deduped += 1
+                    continue
+                seen_movie_uuids.add(movie.uuid)
             cat_name = relation.category.name if relation.category else ""
             movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
                 movie, root_folder, cat_name, nest_by_cat, append_tmdb_id,
@@ -601,6 +636,8 @@ class Plugin:
         logger.info("  Total relations: %d", total_count)
         logger.info("  Scanned:         %d", scanned)
         logger.info("  Already on disk: %d", skipped)
+        if dedupe_across_cats:
+            logger.info("  Deduped (multi-cat): %d", deduped)
         logger.info("  .strm created:   %d", created_strm)
         if refresh_existing:
             logger.info("  .strm refreshed: %d", refreshed_strm)
@@ -616,6 +653,8 @@ class Plugin:
             summary_msg += f" + {created_nfo} .nfo"
         if skipped:
             summary_msg += f" ({skipped} already on disk)"
+        if dedupe_across_cats and deduped:
+            summary_msg += f", deduped {deduped} multi-category duplicates"
 
         return {
             "status": "ok",
@@ -626,6 +665,7 @@ class Plugin:
             "refreshed_strm": refreshed_strm,
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
+            "deduped": deduped,
             "errors": errors,
         }
     
@@ -671,6 +711,7 @@ class Plugin:
         generate_nfo = settings.get("generate_series_nfo", True)
         refresh_existing = bool(settings.get("refresh_existing", False))
         nest_by_cat = bool(settings.get("nest_series_by_category", False))
+        dedupe_across_cats = bool(settings.get("dedupe_series_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
@@ -685,6 +726,7 @@ class Plugin:
             "Generate NFO": "Yes" if generate_nfo else "No",
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
+            "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Workers": self.MAX_WORKERS,
         })
 
@@ -696,6 +738,11 @@ class Plugin:
 
         try:
             query = M3USeriesRelation.objects.select_related('series', 'm3u_account', 'category')
+            if dedupe_across_cats:
+                # See _generate_movies for rationale — deterministic
+                # alphabetical-by-category-name ordering so "first category wins"
+                # is repeatable across runs.
+                query = query.order_by('category__name', 'id')
             total_count = query.count()
 
             if batch_size == "all":
@@ -722,8 +769,17 @@ class Plugin:
             logger.info("Filtering already-processed series...")
         to_process = []
         scanned = 0
+        deduped = 0
+        seen_series_uuids = set() if dedupe_across_cats else None
         for series_rel in query.iterator():
             scanned += 1
+            if seen_series_uuids is not None:
+                if series_rel.series.uuid in seen_series_uuids:
+                    # Same series tagged under multiple categories — already
+                    # going to be processed under the alphabetically-first one.
+                    deduped += 1
+                    continue
+                seen_series_uuids.add(series_rel.series.uuid)
             if not refresh_existing:
                 cat_name = series_rel.category.name if series_rel.category else ""
                 folder, _, _ = self._series_target_folder(
@@ -735,11 +791,13 @@ class Plugin:
             if batch_size != "all" and len(to_process) >= target_batch:
                 break
 
-        skipped_pre = scanned - len(to_process)
+        skipped_pre = scanned - len(to_process) - deduped
         if refresh_existing:
             logger.info("Scanned %d series; %d to evaluate this run", scanned, len(to_process))
         else:
             logger.info("Scanned %d series; %d already processed (skipped); %d to process this run", scanned, skipped_pre, len(to_process))
+        if dedupe_across_cats and deduped:
+            logger.info("Deduped %d multi-category series (only the first-encountered category survives).", deduped)
         logger.info("")
 
         if not to_process:
@@ -750,6 +808,7 @@ class Plugin:
                 "series_processed": 0,
                 "episodes_created": 0,
                 "nfo_created": 0,
+                "deduped": deduped,
                 "errors": 0,
             }
 
@@ -843,10 +902,11 @@ class Plugin:
             "episodes_created": created_strm,
             "episodes_refreshed": refreshed_strm,
             "nfo_created": created_nfo if generate_nfo else 0,
+            "deduped": deduped,
             "errors": errors,
             "failures": failures,
         }
-    
+
     def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False):
         """Process a single series. Idempotent: writes only missing episode files.
 
