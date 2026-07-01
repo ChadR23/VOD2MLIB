@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.15.2",
+  "version": "1.16.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -91,6 +91,20 @@
       "type": "boolean",
       "default": false,
       "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+    },
+    {
+      "id": "omit_stream_id",
+      "label": "Don't pin .strm files to a specific provider stream",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
+    },
+    {
+      "id": "category_filter",
+      "label": "Category Filter (include only)",
+      "type": "string",
+      "default": "",
+      "help_text": "Only generate content whose M3U category name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. Category names are visible in Dispatcharr's VODs UI."
     },
     {
       "id": "_section_series",

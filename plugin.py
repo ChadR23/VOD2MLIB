@@ -1,10 +1,10 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.15.2 — filter Scan + Generate to active M3U accounts only; strip
-          bare trailing year from titles (Wicked: For Good - 2025);
-          warn on Show Status when settings drift from the cron
-          snapshot; clearer folder-migration help text.
+v1.16.0 — language-prefix stripping for pipe / space / bullet formats
+          (EN|, EN, ▪NL▪); new Category Filter (include-only) to limit
+          generation to chosen languages/categories; option to omit
+          ?stream_id= from .strm URLs for provider failover (#6, #3, #5).
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -22,7 +22,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.15.2"
+    version = "1.16.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -47,8 +47,26 @@ class Plugin:
     # File suffixes the plugin writes (used by cleanup and skip logic)
     _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
 
-    # Title cleaning. Whitespace required before the dash so 'AC-130' is preserved.
-    _LANGUAGE_PREFIX_RE = re.compile(r'^[A-Z]{2,3}\s+-\s*')
+    # Language / provider tag prefixes stripped from titles and category names.
+    # Handles the formats providers actually use, each guarded against eating
+    # real titles (see issue #3):
+    #   * "EN - Title"  — dash, any 2-3 letter code. Requires whitespace BEFORE
+    #     the dash so "AC-130" / "MI-5" are preserved.
+    #   * "EN| Title"   — pipe, any 2-3 letter code (a leading pipe is never a
+    #     real title, so any code is safe here).
+    #   * "EN Title"    — bare space, restricted to "EN" ONLY so real titles
+    #     like "IT Chapter Two", "UP (2009)", "ED TV" survive.
+    #   * "▪NL▪ Title"  — bullet-wrapped code, e.g. ▪NL▪ / ▪MULTIG▪ (any 2-8
+    #     letters between marker symbols).
+    _BULLET_CHARS = r'▪▫■□●○•·◦‣⁃︎️'
+    _LANGUAGE_PREFIX_RE = re.compile(
+        r'^(?:'
+        r'[A-Z]{2,3}\s+-\s*'                              # EN - Title
+        r'|[A-Z]{2,3}\s*\|\s*'                            # EN| Title
+        r'|EN\s+'                                         # EN Title (EN only)
+        r'|[' + _BULLET_CHARS + r']+\s*[A-Za-z]{2,8}\s*[' + _BULLET_CHARS + r']+\s*'  # ▪NL▪ Title
+        r')'
+    )
     _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
 
     # First-(YYYY) detector for v1.15.0+ folder-name cleanup. Some providers ship
@@ -173,6 +191,13 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
+        },
+        {
+            "id": "category_filter",
+            "label": "Category Filter (include only)",
+            "type": "string",
+            "default": "",
+            "help_text": "Only generate content whose M3U category name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. Category names are visible in Dispatcharr's VODs UI."
         },
         {
             "id": "_section_series",
@@ -547,6 +572,29 @@ class Plugin:
             return name, year
         return stripped, adopted
 
+    def _parse_category_filter(self, category_filter):
+        """Split the comma-separated category-filter setting into a clean list
+        of non-empty prefixes. Pure/testable."""
+        return [pfx.strip() for pfx in (category_filter or "").split(",") if pfx.strip()]
+
+    def _apply_category_filter(self, query, category_filter):
+        """Restrict an M3U relation queryset to categories whose name starts
+        with any of the comma-separated prefixes (case-insensitive).
+
+        Include-only: when a filter is set, relations with no category — or a
+        category that doesn't match any prefix — are excluded. Empty filter is
+        a no-op (generate everything). Composes with the active-account filter
+        and the dedup ordering.
+        """
+        prefixes = self._parse_category_filter(category_filter)
+        if not prefixes:
+            return query
+        from django.db.models import Q
+        q = Q()
+        for pfx in prefixes:
+            q |= Q(category__name__istartswith=pfx)
+        return query.filter(q)
+
     def _build_proxy_url(self, dispatcharr_url, content_type, uuid, stream_id, omit_stream_id=False):
         """Build a Dispatcharr VOD proxy URL for a .strm file.
 
@@ -598,6 +646,7 @@ class Plugin:
         dedupe_across_cats = bool(settings.get("dedupe_movies_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
         omit_stream_id = bool(settings.get("omit_stream_id", False))
+        category_filter = (settings.get("category_filter") or "").strip()
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -613,6 +662,7 @@ class Plugin:
             "Nest by category": "Yes" if nest_by_cat else "No",
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Append TMDB ID": "Yes" if append_tmdb_id else "No",
+            "Category filter": category_filter or "(all)",
         })
 
         try:
@@ -630,6 +680,7 @@ class Plugin:
                 .select_related('movie', 'm3u_account', 'category')
                 .filter(m3u_account__is_active=True)
             )
+            query = self._apply_category_filter(query, category_filter)
             if dedupe_across_cats:
                 # Deterministic "first category wins" requires a stable sort.
                 # Alphabetical by category name, then relation id as a tiebreaker.
@@ -821,6 +872,7 @@ class Plugin:
         dedupe_across_cats = bool(settings.get("dedupe_series_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
         omit_stream_id = bool(settings.get("omit_stream_id", False))
+        category_filter = (settings.get("category_filter") or "").strip()
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -835,6 +887,7 @@ class Plugin:
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
+            "Category filter": category_filter or "(all)",
             "Workers": self.MAX_WORKERS,
         })
 
@@ -852,6 +905,7 @@ class Plugin:
                 .select_related('series', 'm3u_account', 'category')
                 .filter(m3u_account__is_active=True)
             )
+            query = self._apply_category_filter(query, category_filter)
             if dedupe_across_cats:
                 # See _generate_movies for rationale — deterministic
                 # alphabetical-by-category-name ordering so "first category wins"

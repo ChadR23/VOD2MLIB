@@ -1261,3 +1261,60 @@ class TestBuildProxyUrl:
         # No stream_id available -> can't pin, so no dangling "?stream_id=".
         assert p._build_proxy_url("http://d:9191", "movie", "u", None) == "http://d:9191/proxy/vod/movie/u"
         assert p._build_proxy_url("http://d:9191", "movie", "u", "") == "http://d:9191/proxy/vod/movie/u"
+
+
+# ---------- language-prefix formats (v1.16.0, issue #3) ----------
+
+class TestLanguagePrefixFormats:
+    """The v1.16.0 expansion of _LANGUAGE_PREFIX_RE — pipe / bare-EN / bullet
+    formats, with guards so real titles survive. Exercised through _clean_title
+    (the public consumer)."""
+
+    def test_pipe_any_code(self, p):
+        assert p._clean_title("EN| Alita: Battle Angel 3D") == "Alita: Battle Angel 3D"
+        assert p._clean_title("FR| Le Voyage") == "Le Voyage"
+        assert p._clean_title("DE|Der Film") == "Der Film"
+
+    def test_bare_space_en_only(self, p):
+        assert p._clean_title("EN 27 Gone Too Soon") == "27 Gone Too Soon"
+        assert p._clean_title("EN The Matrix") == "The Matrix"
+
+    def test_bare_space_preserves_non_en_titles(self, p):
+        # These must NOT be treated as language prefixes.
+        assert p._clean_title("IT Chapter Two") == "IT Chapter Two"
+        assert p._clean_title("UP (2009)") == "UP (2009)"
+        assert p._clean_title("ED TV") == "ED TV"
+
+    def test_bullet_wrapped(self, p):
+        assert p._clean_title("▪️NL▪️ Some Movie") == "Some Movie"
+        assert p._clean_title("▪MULTIG▪ Another Film") == "Another Film"
+
+    def test_dash_still_works(self, p):
+        assert p._clean_title("EN - Inception") == "Inception"
+        assert p._clean_title("ENG - Inception") == "Inception"
+        assert p._clean_title("FR -   Amélie") == "Amélie"
+
+    def test_ac130_mi5_still_preserved(self, p):
+        assert p._clean_title("AC-130") == "AC-130"
+        assert p._clean_title("MI-5") == "MI-5"
+
+    def test_no_prefix_unchanged(self, p):
+        assert p._clean_title("The Matrix") == "The Matrix"
+
+
+# ---------- _parse_category_filter (v1.16.0) ----------
+
+class TestParseCategoryFilter:
+    def test_empty_returns_empty_list(self, p):
+        assert p._parse_category_filter("") == []
+        assert p._parse_category_filter(None) == []
+        assert p._parse_category_filter("   ") == []
+
+    def test_single_prefix(self, p):
+        assert p._parse_category_filter("[EN]") == ["[EN]"]
+
+    def test_comma_separated_trimmed(self, p):
+        assert p._parse_category_filter("[EN], [FR] , [DE]") == ["[EN]", "[FR]", "[DE]"]
+
+    def test_drops_empty_segments(self, p):
+        assert p._parse_category_filter("[EN],,, [FR] ,") == ["[EN]", "[FR]"]

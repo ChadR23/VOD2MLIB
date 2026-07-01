@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.16.0 — language-prefix formats, category filter, optional stream_id omission
+
+Three community-requested features, all opt-in / backwards-compatible.
+
+- **Language-prefix stripping now handles more provider formats** ([#3](https://github.com/R3XCHRIS/VOD2MLIB/issues/3), thanks **BrianWinhere** + **mola1980**). The old regex only stripped `EN - ` (dash). It now also handles:
+  - **Pipe** — `EN| Alita: Battle Angel 3D` → `Alita: Battle Angel 3D` (any 2–3 letter code).
+  - **Bare space, `EN` only** — `EN 27 Gone Too Soon` → `27 Gone Too Soon`. Restricted to `EN` on purpose so real titles like `IT Chapter Two`, `UP (2009)`, `ED TV` are preserved.
+  - **Bullet-wrapped** — `▪NL▪ Title` / `▪MULTIG▪ Title` → `Title`.
+  - The existing `AC-130` / `MI-5` carve-outs are still preserved. Applies to titles, folder names, and category-derived genres.
+
+- **New `Category Filter (include only)` setting** ([#3](https://github.com/R3XCHRIS/VOD2MLIB/issues/3), [#2](https://github.com/R3XCHRIS/VOD2MLIB/issues/2)). Comma-separated category-name prefixes (e.g. `[EN],[FR]`, case-insensitive) — only content whose M3U category starts with one of them is generated. Filters at the **database-query level**, so on a 246k-folder multi-language catalogue you generate only the few thousand you want, without ever creating-then-cleaning-up the rest. Applies to both Movies and Series. Empty = generate everything (default, no change). When set, content with no matching category is skipped.
+
+- **New `Don't pin .strm files to a specific provider stream` setting** ([#5](https://github.com/R3XCHRIS/VOD2MLIB/issues/5) / [PR #6](https://github.com/R3XCHRIS/VOD2MLIB/pull/6), thanks **mcortt**). Omits `?stream_id=` from generated `.strm` URLs so Dispatcharr's VOD proxy can fail over across accounts by priority instead of being pinned to one relation. Default off (matches current behaviour); only useful once Dispatcharr's VOD failover ([#1398](https://github.com/Dispatcharr/Dispatcharr/pull/1398)) lands upstream, documented in the help text. Also merged as a proper `omit_stream_id` field in the catalogue manifest and refactored the URL construction into one tested `_build_proxy_url` helper.
+
+Defaults unchanged; no settings migration. New unit tests for the language regex, category-filter parsing, and proxy-URL builder.
+
 ## v1.15.2 — active-account filter, bare-year cleanup, schedule-drift warning
 
 Four community-reported fixes, all backwards-compatible.
