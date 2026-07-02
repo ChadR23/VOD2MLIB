@@ -285,3 +285,66 @@ class TestFetchIndex:
         monkeypatch.setattr(emby, "_http_get_json", boom)
         with pytest.raises(EmbyError):
             fetch_index("http://emby:8096", "k", ["Movies"], FakeLogger())
+
+
+from emby import build_emby_index
+
+GOOD_SETTINGS = {
+    "emby_enabled": True,
+    "emby_url": "http://emby:8096/",   # trailing slash on purpose
+    "emby_api_key": "k",
+    "emby_libraries": "Movies, TV Shows",
+}
+
+
+class TestBuildEmbyIndex:
+    def test_disabled_returns_none(self, tmp_path):
+        idx, source = build_emby_index({"emby_enabled": False}, FakeLogger(), str(tmp_path / "c.json"))
+        assert idx is None and source == "disabled"
+
+    def test_enabled_but_unconfigured_is_disabled_with_warning(self, tmp_path):
+        log = FakeLogger()
+        idx, source = build_emby_index({"emby_enabled": True}, log, str(tmp_path / "c.json"))
+        assert idx is None and source == "disabled"
+        assert log.warnings  # tells the user what's missing
+
+    def test_live_fetch_writes_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {"Movie": MOVIE_ITEMS, "Series": SERIES_ITEMS, "Episode": EPISODE_ITEMS}))
+        cache = tmp_path / "c.json"
+        idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(cache))
+        assert source == "live"
+        assert idx.has_movie("Heat", 1995)
+        assert cache.exists()
+
+    def test_fetch_failure_falls_back_to_cache(self, tmp_path, monkeypatch):
+        # First: a good run to populate the cache
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {"Movie": MOVIE_ITEMS, "Series": SERIES_ITEMS, "Episode": EPISODE_ITEMS}))
+        cache = tmp_path / "c.json"
+        build_emby_index(GOOD_SETTINGS, FakeLogger(), str(cache))
+        # Then: Emby goes down
+        def boom(*a, **kw):
+            raise EmbyError("down")
+        monkeypatch.setattr(emby, "_http_get_json", boom)
+        log = FakeLogger()
+        idx, source = build_emby_index(GOOD_SETTINGS, log, str(cache))
+        assert source == "cache"
+        assert idx.has_movie("Heat", 1995)
+        assert log.warnings
+
+    def test_fetch_failure_no_cache_returns_unavailable(self, tmp_path, monkeypatch):
+        def boom(*a, **kw):
+            raise EmbyError("down")
+        monkeypatch.setattr(emby, "_http_get_json", boom)
+        idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(tmp_path / "nope.json"))
+        assert idx is None and source == "unavailable"
+
+    def test_corrupt_cache_returns_unavailable(self, tmp_path, monkeypatch):
+        def boom(*a, **kw):
+            raise EmbyError("down")
+        monkeypatch.setattr(emby, "_http_get_json", boom)
+        cache = tmp_path / "c.json"
+        cache.write_text("{not json", encoding="utf-8")
+        idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(cache))
+        assert idx is None and source == "unavailable"

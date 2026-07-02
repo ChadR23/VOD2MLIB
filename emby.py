@@ -311,3 +311,70 @@ def trigger_library_refresh(base_url, api_key, logger):
     except Exception as e:
         logger.warning("Emby library refresh trigger failed (non-fatal): %s", e)
         return False
+
+
+# ---------- orchestration: settings -> index (with cache fallback) ----------
+
+def _parse_libraries(raw):
+    return [name.strip() for name in (raw or "").split(",") if name.strip()]
+
+
+def save_cache(index, cache_path, logger):
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(index.to_dict(), f)
+    except OSError as e:
+        logger.warning("Could not write Emby index cache %s: %s", cache_path, e)
+
+
+def load_cache(cache_path, logger):
+    """Returns an EmbyIndex from the cache file, or None if absent/corrupt."""
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return EmbyIndex.from_dict(json.load(f))
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        logger.warning("Emby index cache %s unreadable (%s) — ignoring it.", cache_path, e)
+        return None
+
+
+def build_emby_index(settings, logger, cache_path):
+    """Resolve settings into an owned-content index.
+
+    Returns (index_or_None, source) with source in:
+      "live"        — fresh from the Emby API (cache updated)
+      "cache"       — Emby unreachable, last good index used (stale-but-safe)
+      "disabled"    — feature off or not configured; dedup is a no-op
+      "unavailable" — Emby unreachable AND no cache; caller MUST NOT skip
+                      or delete anything this run
+    """
+    if not settings.get("emby_enabled", False):
+        return None, "disabled"
+    base_url = (settings.get("emby_url") or "").strip().rstrip("/")
+    api_key = (settings.get("emby_api_key") or "").strip()
+    libraries = _parse_libraries(settings.get("emby_libraries"))
+    problems = []
+    if not base_url.startswith(("http://", "https://")):
+        problems.append("Emby URL missing or not http(s)")
+    if not api_key:
+        problems.append("Emby API key missing")
+    if not libraries:
+        problems.append("Emby libraries list empty")
+    if problems:
+        logger.warning("Emby dedup is ON but not usable: %s. Dedup disabled this run.",
+                       "; ".join(problems))
+        return None, "disabled"
+    try:
+        idx = fetch_index(base_url, api_key, libraries, logger)
+        save_cache(idx, cache_path, logger)
+        return idx, "live"
+    except EmbyError as e:
+        logger.warning("Emby fetch failed: %s", e)
+        cached = load_cache(cache_path, logger)
+        if cached is not None and not cached.is_empty:
+            logger.warning("Using last good Emby index from cache (stale-but-safe).")
+            return cached, "cache"
+        logger.warning("No usable Emby index cache — dedup fully disabled this run "
+                       "(nothing will be skipped or deleted).")
+        return None, "unavailable"
