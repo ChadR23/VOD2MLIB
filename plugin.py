@@ -17,12 +17,27 @@ import re
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# emby.py sits beside this file. Dispatcharr may load plugin.py either as a
+# package module or as a flat file, so try relative first, then flat with the
+# plugin dir on sys.path (which is also how the tests import it).
+try:
+    from .emby import build_emby_index, trigger_library_refresh
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from emby import build_emby_index, trigger_library_refresh
+
+# Distinguishes "caller didn't pass an index" (resolve it from settings)
+# from "caller resolved it and got None" (dedup off/unavailable — do NOT
+# re-attempt the HTTP fetch).
+_EMBY_UNSET = object()
+
 
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.16.0"
+    version = "1.16.0-emby.1"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -191,6 +206,68 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
+        },
+        {
+            "id": "_section_emby",
+            "label": "[EMBY DEDUP]",
+            "type": "info",
+            "description": "Skip VODs you already own as real files in Emby, and remove .strm files for content you acquire later. Configure the Emby connection, then use '[EMBY] Test connection' in Actions. Start with Dry Run ON.",
+        },
+        {
+            "id": "emby_enabled",
+            "label": "Enable Emby dedup",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Master switch. When OFF, the plugin behaves exactly like stock VOD2MLIB.",
+        },
+        {
+            "id": "emby_url",
+            "label": "Emby Server URL",
+            "type": "string",
+            "default": "",
+            "help_text": "e.g. http://192.168.1.10:8096 — must be reachable from inside the Dispatcharr container.",
+        },
+        {
+            "id": "emby_api_key",
+            "label": "Emby API Key",
+            "type": "string",
+            "default": "",
+            "help_text": "Emby Dashboard → Advanced → API Keys → New API Key.",
+        },
+        {
+            "id": "emby_libraries",
+            "label": "Emby libraries that count as 'owned'",
+            "type": "string",
+            "default": "",
+            "help_text": "Comma-separated Emby library names holding your REAL files, e.g. 'Movies, TV Shows'. Do NOT list the library that indexes this plugin's .strm output (as a safety net, .strm items are excluded from matching anyway).",
+        },
+        {
+            "id": "emby_skip_owned",
+            "label": "Skip owned items during generation",
+            "type": "boolean",
+            "default": True,
+            "help_text": "Don't write .strm files for movies/episodes that exist as real files in the libraries above. Episode-level: seasons/episodes you don't own still generate.",
+        },
+        {
+            "id": "emby_remove_owned",
+            "label": "Remove owned items during rescan",
+            "type": "boolean",
+            "default": True,
+            "help_text": "After each full rescan, delete previously-written .strm/.nfo for content you now own for real. Also available manually via '[EMBY] Remove owned duplicates'.",
+        },
+        {
+            "id": "emby_dry_run",
+            "label": "Dry run (log only)",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Log every would-skip and would-delete decision without changing anything on disk. Recommended ON for your first runs — check the plugin log, then turn OFF.",
+        },
+        {
+            "id": "emby_trigger_refresh",
+            "label": "Trigger Emby library refresh after removals",
+            "type": "boolean",
+            "default": False,
+            "help_text": "POST /Library/Refresh to Emby when the cleanup pass deleted files, so the entries disappear from Emby promptly.",
         },
         {
             "id": "category_filter",
@@ -860,6 +937,18 @@ class Plugin:
             )
         except OSError:
             return False
+
+    def _get_emby_index(self, settings: Dict[str, Any], logger):
+        """Build (or cache-load) the owned-content index. Returns None when
+        Emby dedup is disabled, misconfigured, or unavailable-with-no-cache —
+        callers treat None as 'no dedup this run'."""
+        cache_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
+        )
+        index, source = build_emby_index(settings, logger, cache_path)
+        if index is not None:
+            logger.info("Emby dedup index ready (source: %s) — %s", source, index.summary())
+        return index
 
     def _generate_series(self, settings: Dict[str, Any], logger):
         """Generate series .strm files with episodes using parallel processing."""
