@@ -90,3 +90,89 @@ def parse_episode_strm(filename):
     if not m:
         return None
     return m.group('series').strip(), int(m.group('s')), int(m.group('e'))
+
+
+# ---------- owned-content index ----------
+
+class EmbyIndex:
+    """Fast lookup of content owned as real files in Emby.
+
+    Built once per run, then read-only — safe to share across the
+    ThreadPoolExecutor workers in _generate_series.
+    """
+
+    def __init__(self):
+        self.movie_tmdb = set()        # str tmdb ids
+        self.movie_imdb = set()        # str imdb ids, lowercased
+        self.movie_title_year = set()  # (normalized_title, int_year)
+        self.episode_by_name = set()   # (normalized_series, season, episode)
+        self.episode_by_tmdb = set()   # (str series_tmdb, season, episode)
+
+    def add_movie(self, name, year, tmdb_id=None, imdb_id=None):
+        if tmdb_id:
+            self.movie_tmdb.add(str(tmdb_id))
+        if imdb_id:
+            self.movie_imdb.add(str(imdb_id).lower())
+        key = normalize_title(name)
+        if key and year:
+            self.movie_title_year.add((key, int(year)))
+
+    def add_episode(self, series_name, season, episode, series_tmdb_id=None):
+        s, e = int(season), int(episode)
+        key = normalize_title(series_name)
+        if key:
+            self.episode_by_name.add((key, s, e))
+        if series_tmdb_id:
+            self.episode_by_tmdb.add((str(series_tmdb_id), s, e))
+
+    def has_movie(self, title, year, tmdb_id=None, imdb_id=None):
+        if tmdb_id and str(tmdb_id) in self.movie_tmdb:
+            return True
+        if imdb_id and str(imdb_id).lower() in self.movie_imdb:
+            return True
+        if not year:
+            return False  # never title-only — remakes would false-positive
+        key = normalize_title(title)
+        if not key:
+            return False
+        y = int(year)
+        return any((key, cand) in self.movie_title_year for cand in (y, y - 1, y + 1))
+
+    def has_episode(self, series_title, season, episode, series_tmdb_id=None):
+        s, e = int(season), int(episode)
+        if series_tmdb_id and (str(series_tmdb_id), s, e) in self.episode_by_tmdb:
+            return True
+        key = normalize_title(series_title)
+        return bool(key) and (key, s, e) in self.episode_by_name
+
+    @property
+    def is_empty(self):
+        return not (self.movie_tmdb or self.movie_imdb or self.movie_title_year
+                    or self.episode_by_name or self.episode_by_tmdb)
+
+    def summary(self):
+        # movie_title_year and movie_tmdb overlap for well-tagged items, so a
+        # precise count isn't possible from sets alone — report the larger.
+        movies = max(len(self.movie_title_year), len(self.movie_tmdb))
+        episodes = max(len(self.episode_by_name), len(self.episode_by_tmdb))
+        return f"{movies} movies, {episodes} episodes owned"
+
+    def to_dict(self):
+        return {
+            "version": 1,
+            "movie_tmdb": sorted(self.movie_tmdb),
+            "movie_imdb": sorted(self.movie_imdb),
+            "movie_title_year": sorted(self.movie_title_year),
+            "episode_by_name": sorted(self.episode_by_name),
+            "episode_by_tmdb": sorted(self.episode_by_tmdb),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        idx = cls()
+        idx.movie_tmdb = {str(x) for x in data["movie_tmdb"]}
+        idx.movie_imdb = {str(x) for x in data["movie_imdb"]}
+        idx.movie_title_year = {(t, int(y)) for t, y in data["movie_title_year"]}
+        idx.episode_by_name = {(n, int(s), int(e)) for n, s, e in data["episode_by_name"]}
+        idx.episode_by_tmdb = {(str(i), int(s), int(e)) for i, s, e in data["episode_by_tmdb"]}
+        return idx
