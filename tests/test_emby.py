@@ -371,3 +371,22 @@ class TestEmbyOwnedMovie:
     def test_blank_ids_treated_as_absent(self, idx):
         p = Plugin()
         assert not p._emby_owned_movie(idx, "Barbie", 2023, FakeMovie(tmdb_id="  ", imdb_id=""))
+
+
+class FakeSeries:
+    def __init__(self, tmdb_id=""):
+        self.tmdb_id = tmdb_id
+
+
+class TestEmbyOwnedEpisode:
+    def test_matches_by_name_and_numbers(self, idx):
+        p = Plugin()
+        assert p._emby_owned_episode(idx, FakeSeries(), "BEEF", 2, 7)
+
+    def test_matches_by_series_tmdb(self, idx):
+        p = Plugin()
+        assert p._emby_owned_episode(idx, FakeSeries(tmdb_id="223333"), "Renamed Show", 2, 7)
+
+    def test_unowned_episode_not_matched(self, idx):
+        p = Plugin()
+        assert not p._emby_owned_episode(idx, FakeSeries(tmdb_id="223333"), "BEEF", 2, 8)

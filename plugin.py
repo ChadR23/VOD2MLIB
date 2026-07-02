@@ -977,7 +977,13 @@ class Plugin:
         imdb_id = (getattr(movie, "imdb_id", "") or "").strip() or None
         return emby_index.has_movie(clean_name, year, tmdb_id=tmdb_id, imdb_id=imdb_id)
 
-    def _generate_series(self, settings: Dict[str, Any], logger):
+    def _emby_owned_episode(self, emby_index, series, series_name, season_num, episode_num) -> bool:
+        """True when this exact episode exists as a real file in Emby.
+        Matches on series identity + S/E numbers only — never episode titles."""
+        tmdb_id = (getattr(series, "tmdb_id", "") or "").strip() or None
+        return emby_index.has_episode(series_name, season_num, episode_num, series_tmdb_id=tmdb_id)
+
+    def _generate_series(self, settings: Dict[str, Any], logger, emby_index=_EMBY_UNSET):
         """Generate series .strm files with episodes using parallel processing."""
         series_root = settings.get("series_root_folder", "/VODS/Series")
         dispatcharr_url = (settings.get("dispatcharr_url") or "").rstrip("/")
@@ -989,6 +995,11 @@ class Plugin:
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
+
+        if emby_index is _EMBY_UNSET:
+            emby_index = self._get_emby_index(settings, logger)
+        emby_skip = emby_index is not None and bool(settings.get("emby_skip_owned", True))
+        emby_dry = bool(settings.get("emby_dry_run", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -1102,6 +1113,7 @@ class Plugin:
         errors = 0
         series_created = 0
         series_uptodate = 0
+        owned_skipped = 0
         failures = []
 
         logger.info("Processing %d series with %d parallel workers:", len(to_process), self.MAX_WORKERS)
@@ -1120,6 +1132,9 @@ class Plugin:
                     nest_by_cat,
                     append_tmdb_id,
                     omit_stream_id,
+                    emby_index,
+                    emby_skip,
+                    emby_dry,
                 ): series_rel
                 for series_rel in to_process
             }
@@ -1142,6 +1157,7 @@ class Plugin:
                     created_strm += result["episodes"]
                     refreshed_strm += result.get("refreshed", 0)
                     created_nfo += result["nfo_files"]
+                owned_skipped += result.get("owned_skipped", 0)
                 if "error" in result:
                     errors += 1
                     failures.append(f"{result.get('series_name', '?')}: {result['error']}")
@@ -1157,6 +1173,9 @@ class Plugin:
             logger.info("  Refreshed episode URLs:  %d", refreshed_strm)
         if generate_nfo:
             logger.info("  New NFO files:           %d", created_nfo)
+        if emby_skip:
+            label = "Owned in Emby (would skip)" if emby_dry else "Owned in Emby (skipped)"
+            logger.info("  %s: %d", label, owned_skipped)
         logger.info("  Errors:                  %d", errors)
         logger.info("=" * 60)
 
@@ -1189,10 +1208,11 @@ class Plugin:
             "nfo_created": created_nfo if generate_nfo else 0,
             "deduped": deduped,
             "errors": errors,
+            "owned_skipped": owned_skipped,
             "failures": failures,
         }
 
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False):
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, emby_index=None, emby_skip=False, emby_dry=False):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
@@ -1242,6 +1262,7 @@ class Plugin:
                     "series_name": series_name,
                     "episodes": 0,
                     "nfo_files": 0,
+                    "owned_skipped": 0,
                     "message": f"{series_name} - No episodes found",
                 }
 
@@ -1250,6 +1271,7 @@ class Plugin:
             new_episodes = 0
             refreshed_episodes = 0
             new_nfo = 0
+            owned_skipped = 0
 
             if generate_nfo:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
@@ -1264,6 +1286,13 @@ class Plugin:
                 episode = episode_rel.episode
                 season_num = episode.season_number or 0
                 episode_num = episode.episode_number or 0
+
+                if emby_skip and self._emby_owned_episode(emby_index, series, series_name, season_num, episode_num):
+                    owned_skipped += 1
+                    if emby_dry:
+                        logger.info("  [EMBY DRY-RUN] owned, would skip: %s S%02dE%02d", series_name, season_num, episode_num)
+                    else:
+                        continue
 
                 season_folder_name = f"Season {season_num:02d}"
                 season_folder = os.path.join(series_folder, season_folder_name)
@@ -1307,6 +1336,7 @@ class Plugin:
                     "episodes": 0,
                     "refreshed": 0,
                     "nfo_files": new_nfo,
+                    "owned_skipped": owned_skipped,
                     "message": f"{series_name} - up-to-date ({episode_count} episodes on disk)",
                 }
 
@@ -1324,6 +1354,7 @@ class Plugin:
                 "episodes": new_episodes,
                 "refreshed": refreshed_episodes,
                 "nfo_files": new_nfo,
+                "owned_skipped": owned_skipped,
                 "message": msg,
             }
 
@@ -1334,6 +1365,7 @@ class Plugin:
                 "series_name": series_name,
                 "episodes": 0,
                 "nfo_files": 0,
+                "owned_skipped": 0,
                 "error": str(e),
                 "message": f"{series_name} - ✗ Error: {e}",
             }
