@@ -2105,18 +2105,28 @@ class Plugin:
         if scan.get("status") != "ok":
             return scan
 
+        emby_index = self._get_emby_index(settings, logger)
+
         logger.info("")
         logger.info("=" * 60)
         logger.info("Rescan: movies  (refresh_urls=True)")
         logger.info("=" * 60)
-        movies = self._generate_movies(settings, logger, refresh_urls=True)
+        movies = self._generate_movies(settings, logger, refresh_urls=True, emby_index=emby_index)
 
         logger.info("")
         logger.info("=" * 60)
         logger.info("Rescan: series  (refresh_existing=True)")
         logger.info("=" * 60)
         series_settings = {**settings, "refresh_existing": True}
-        series = self._generate_series(series_settings, logger)
+        series = self._generate_series(series_settings, logger, emby_index=emby_index)
+
+        owned = None
+        if emby_index is not None and settings.get("emby_remove_owned", True):
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("Rescan: Emby owned-content cleanup")
+            logger.info("=" * 60)
+            owned = self._cleanup_owned(settings, logger, emby_index=emby_index)
 
         m = movies if isinstance(movies, dict) else {}
         s = series if isinstance(series, dict) else {}
@@ -2142,9 +2152,20 @@ class Plugin:
         if sc_uptodate:
             series_extra += f" ({sc_uptodate} up-to-date)"
 
+        o = owned if isinstance(owned, dict) else {}
+        emby_extra = ""
+        owned_skipped_total = m.get("owned_skipped", 0) + s.get("owned_skipped", 0)
+        if owned_skipped_total or o.get("deleted_strm"):
+            dry = bool(settings.get("emby_dry_run", False))
+            skip_verb = "would skip" if dry else "skipped"
+            del_verb = "would remove" if dry else "removed"
+            emby_extra = (f" Emby dedup: {skip_verb} {owned_skipped_total} owned,"
+                          f" {del_verb} {o.get('deleted_strm', 0)} .strm.")
+
         message = (
             f"Rescan complete. Movies: {movie_strm} new{movie_extra}. "
             f"Series: {ep_new} new episodes across {sc_new} series{series_extra}."
+            f"{emby_extra}"
         )
         if total_errors:
             message += f" {total_errors} errors — see logs."
@@ -2155,6 +2176,7 @@ class Plugin:
             "scan": scan,
             "movies": movies,
             "series": series,
+            "owned_cleanup": owned,
         }
 
     def _validate_timezone(self, tz_str: str):
