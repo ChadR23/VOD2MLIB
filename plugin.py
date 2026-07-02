@@ -1266,6 +1266,32 @@ class Plugin:
                     "message": f"{series_name} - No episodes found",
                 }
 
+            # Fully-owned series: bail out BEFORE creating the folder or
+            # tvshow.nfo, otherwise every fully-owned show leaves an empty
+            # folder with an orphan tvshow.nfo behind on every rescan.
+            # In dry-run we deliberately fall through — the series must be
+            # processed exactly as stock behavior (episodes still written).
+            if emby_skip and not emby_dry:
+                owned_count = sum(
+                    1 for episode_rel in episodes
+                    if self._emby_owned_episode(
+                        emby_index, series, series_name,
+                        episode_rel.episode.season_number or 0,
+                        episode_rel.episode.episode_number or 0,
+                    )
+                )
+                if owned_count == episode_count:
+                    return {
+                        "created": False,
+                        "uptodate": True,
+                        "series_name": series_name,
+                        "episodes": 0,
+                        "refreshed": 0,
+                        "nfo_files": 0,
+                        "owned_skipped": owned_count,
+                        "message": f"{series_name} - fully owned in Emby ({owned_count} episodes), skipped",
+                    }
+
             os.makedirs(series_folder, exist_ok=True)
 
             new_episodes = 0
