@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.16.0-emby.1 (fork)
+
+**Emby-aware dedup** — skip and remove VOD .strm files for content you already
+own as real files in Emby.
+
+- New `[EMBY DEDUP]` settings section: server URL, API key, owned libraries,
+  skip/remove toggles, dry-run, optional post-cleanup library refresh.
+- Generation (movies + episodes) skips items found in the owned-content index.
+  Episode-level: seasons/episodes you don't own still generate. Matching by
+  TMDB/IMDB id or normalized title+year (movies, ±1yr) and series+SxxEyy
+  numbers (episodes) — never episode titles.
+- Full rescan runs an owned-content cleanup pass that deletes .strm/.nfo for
+  since-acquired items (also available as the `[EMBY] Remove owned duplicates`
+  action). tvshow.nfo and empty folders pruned; user files preserved.
+- Fail-safe: on Emby fetch failure the last good index (JSON cache) is used;
+  with no cache, dedup is fully disabled for the run — nothing is skipped or
+  deleted on bad data. Emby items that are themselves .strm are never counted
+  as owned.
+- New `[EMBY] Test connection` action reports owned-content counts.
+- Off by default (`emby_enabled`); with it off, behavior is identical to
+  v1.16.0.
+
 ## v1.16.0 — language-prefix formats, category filter, optional stream_id omission
 
 Three community-requested features, all opt-in / backwards-compatible.

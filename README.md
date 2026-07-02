@@ -135,6 +135,31 @@ The Settings tab is grouped into four sections:
 |  | Schedule Timezone | IANA timezone the cron is interpreted in (e.g. `Europe/London`). Empty = UTC. Handles DST automatically. |
 |  | Scheduled Action | What the cron fires (full rescan recommended) |
 
+## Emby dedup (fork feature)
+
+If you already own some titles as real files in an Emby library, this fork can stop VOD `.strm` files being generated for them — and remove the ones already on disk — so your media servers show one copy instead of a real-file/streamed pair. It queries Emby for your owned libraries, builds an owned-content index, and matches VOD items against it during generation and during a cleanup pass. It's **off by default** (`emby_enabled`); with it off, behaviour is identical to v1.16.0.
+
+The `[EMBY DEDUP]` settings section:
+
+| Field | What it does |
+|---|---|
+| Enable Emby dedup (`emby_enabled`) | Master switch. Off by default — nothing is skipped or removed while off. |
+| Emby Server URL | Base URL of your Emby server (e.g. `http://192.168.1.10:8096`). |
+| Emby API Key | API key from Emby Dashboard → Advanced → API Keys. |
+| Owned Libraries | Comma-separated names of the REAL-file libraries to treat as owned (e.g. `Movies, TV Shows`) — NOT the streamed/VOD library. |
+| Skip owned during generation | Don't generate `.strm` for items found in the owned index. Episode-level for series — seasons/episodes you don't own still generate. |
+| Remove owned duplicates | During full rescan (and the `[EMBY] Remove owned duplicates` action), delete `.strm`/`.nfo` for since-acquired owned items. `tvshow.nfo` and empty folders pruned; user files preserved. |
+| Dry Run | Log what would be skipped/deleted without touching disk. Use for the first run. |
+| Trigger Emby library refresh | Optional — refresh the Emby library after a cleanup pass so removals are picked up faster. |
+
+Matching is by TMDB/IMDB id, or normalized title+year for movies (±1yr) and series name + `SxxEyy` numbers for episodes — never episode titles. On an Emby fetch failure the last good index (JSON cache) is reused; with no cache, dedup is fully disabled for that run, so nothing is skipped or deleted on bad data.
+
+**First run (do a dry run first).**
+1. `[EMBY DEDUP]`: Enable ON, set URL / API key / libraries, **Dry Run ON**, Save.
+2. Click `[EMBY] Test connection` — expect a report of owned-content counts (if it errors, the log lists the available library names).
+3. Click `Rescan all` and review the plugin log — `[EMBY DRY-RUN] owned, would skip: ...` and `[EMBY DRY-RUN] would delete: ...` lines show exactly what would happen.
+4. Once matching looks right: **Dry Run OFF**, Save, and run `Rescan all` again to apply.
+
 ## Workflow
 
 **First run.** Configure paths → click `[LIBRARY] Catalogue snapshot` to verify the plugin can see your VODs → click `[GENERATE] Movies` with Batch Size 10 → spot-check the output → scale up.
