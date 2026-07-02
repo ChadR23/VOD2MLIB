@@ -83,8 +83,8 @@ def idx():
     i = EmbyIndex()
     i.add_movie("The Matrix", 1999, tmdb_id="603", imdb_id="tt0133093")
     i.add_movie("Heat", 1995)                       # no provider ids
-    i.add_episode("BEEF", 2, 7, series_tmdb_id="223333")
-    i.add_episode("Smiling Friends", 1, 3)          # no tmdb
+    i.add_episode("BEEF", 2, 7, series_tmdb_id="223333", series_year=2023)
+    i.add_episode("Smiling Friends", 1, 3)          # no tmdb, no year
     return i
 
 
@@ -139,6 +139,53 @@ class TestEmbyIndexEpisodes:
         assert not idx.has_episode("Severance", 1, 1)
 
 
+class TestEmbyIndexEpisodesYearAware:
+    def test_same_name_different_year_no_false_positive(self):
+        # Owning The Office (2005) S01E01 must NOT match The Office (2001) S01E01
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        assert not i.has_episode("The Office", 1, 1, series_year=2001)
+
+    def test_exact_year_matches(self):
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        assert i.has_episode("The Office", 1, 1, series_year=2005)
+
+    def test_year_off_by_one_matches(self):
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        assert i.has_episode("The Office", 1, 1, series_year=2006)
+        assert i.has_episode("The Office", 1, 1, series_year=2004)
+
+    def test_year_off_by_two_no_match(self):
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        assert not i.has_episode("The Office", 1, 1, series_year=2007)
+
+    def test_none_queried_year_is_loose(self):
+        # VOD side has no year → fall back to loose (name, s, e) match
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        assert i.has_episode("The Office", 1, 1, series_year=None)
+
+    def test_yearless_owned_matches_any_queried_year(self):
+        # Owned series has no known year → matches whatever year the VOD claims
+        i = EmbyIndex()
+        i.add_episode("Smiling Friends", 1, 3)  # no series_year
+        assert i.has_episode("Smiling Friends", 1, 3, series_year=2020)
+        assert i.has_episode("Smiling Friends", 1, 3, series_year=1999)
+        assert i.has_episode("Smiling Friends", 1, 3, series_year=None)
+
+    def test_fixture_beef_loose_without_year(self, idx):
+        # No queried year → loose fallback still finds BEEF S02E07
+        assert idx.has_episode("BEEF", 2, 7)
+
+    def test_fixture_smiling_friends_year_suffix_still_loose(self, idx):
+        # normalize_title strips the (2020) suffix; no series_year param passed
+        # → loose path, still matches the yearless owned Smiling Friends
+        assert idx.has_episode("Smiling Friends (2020)", 1, 3)
+
+
 class TestEmbyIndexMisc:
     def test_is_empty(self, idx):
         assert not idx.is_empty
@@ -159,6 +206,29 @@ class TestEmbyIndexMisc:
     def test_from_dict_garbage_raises(self):
         with pytest.raises(Exception):
             EmbyIndex.from_dict({"movies": "nope"})
+
+    def test_roundtrip_preserves_year_aware_behavior(self):
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        i.add_episode("Smiling Friends", 1, 3)  # yearless
+        clone = EmbyIndex.from_dict(i.to_dict())
+        assert clone.has_episode("The Office", 1, 1, series_year=2005)
+        assert not clone.has_episode("The Office", 1, 1, series_year=2001)
+        assert clone.has_episode("Smiling Friends", 1, 3, series_year=2020)
+
+    def test_from_dict_old_cache_without_new_keys_loads_loosely(self):
+        # Simulate an old cache file (version 1) lacking the two year-aware keys.
+        old = {
+            "version": 1,
+            "movie_tmdb": [], "movie_imdb": [], "movie_title_year": [],
+            "episode_by_name": [["the office", 1, 1]],
+            "episode_by_tmdb": [],
+        }
+        idx = EmbyIndex.from_dict(old)
+        # Loose behavior (old semantics): matches regardless of queried year
+        assert idx.has_episode("The Office", 1, 1)
+        assert idx.has_episode("The Office", 1, 1, series_year=2005)
+        assert idx.has_episode("The Office", 1, 1, series_year=2001)
 
 
 import emby
@@ -208,7 +278,8 @@ MOVIE_ITEMS = [
 ]
 
 SERIES_ITEMS = [
-    {"Id": "ser1", "Name": "BEEF", "Path": "/jbod/tv/BEEF", "ProviderIds": {"Tmdb": "223333"}},
+    {"Id": "ser1", "Name": "BEEF", "Path": "/jbod/tv/BEEF", "ProductionYear": 2023,
+     "ProviderIds": {"Tmdb": "223333"}},
     {"Id": "ser2", "Name": "Smiling Friends", "Path": "/jbod/tv/Smiling Friends", "ProviderIds": {}},
 ]
 
@@ -239,6 +310,22 @@ class TestResolveLibraryIds:
         assert "Moviez" in str(exc.value)
         assert "Movies" in str(exc.value)  # lists what IS available
 
+    def test_dict_shaped_virtual_folders_resolves(self, monkeypatch):
+        # Some Emby builds return VirtualFolders as {"Items": [...]} not a bare list
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {}, virtual_folders={"Items": VIRTUAL_FOLDERS}))
+        ids = resolve_library_ids("http://emby:8096", "k", ["Movies", "TV Shows"])
+        assert ids == {"Movies": "lib1", "TV Shows": "lib2"}
+
+    def test_matched_folder_without_itemid_raises(self, monkeypatch):
+        # A folder that matches by name but exposes no ItemId/Id must raise,
+        # not silently return an empty ParentId (which queries the whole server).
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {}, virtual_folders=[{"Name": "Movies", "CollectionType": "movies"}]))
+        with pytest.raises(EmbyError) as exc:
+            resolve_library_ids("http://emby:8096", "k", ["Movies"])
+        assert "no ItemId" in str(exc.value)
+
 
 class TestFetchIndex:
     def fetch(self, monkeypatch, **kw):
@@ -263,6 +350,13 @@ class TestFetchIndex:
         assert idx.has_episode("BEEF", 2, 7)
         assert idx.has_episode("anything", 2, 7, series_tmdb_id="223333")
         assert idx.has_episode("Smiling Friends", 1, 3)
+
+    def test_episodes_indexed_with_series_year(self, monkeypatch):
+        # BEEF series has ProductionYear 2023 → a same-name remake year is rejected,
+        # but the real year is accepted.
+        idx = self.fetch(monkeypatch)
+        assert not idx.has_episode("BEEF", 2, 7, series_year=1990)
+        assert idx.has_episode("BEEF", 2, 7, series_year=2023)
 
     def test_episode_missing_numbers_skipped(self, monkeypatch):
         idx = self.fetch(monkeypatch)
@@ -347,6 +441,15 @@ class TestBuildEmbyIndex:
         cache = tmp_path / "c.json"
         cache.write_text("{not json", encoding="utf-8")
         idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(cache))
+        assert idx is None and source == "unavailable"
+
+    def test_non_emby_exception_in_fetch_degrades_gracefully(self, tmp_path, monkeypatch):
+        # Mis-shaped Emby data can raise AttributeError/TypeError/ValueError from
+        # the fetch path — build_emby_index must degrade (unavailable), not crash.
+        def boom(*a, **kw):
+            raise AttributeError("shape")
+        monkeypatch.setattr(emby, "_http_get_json", boom)
+        idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(tmp_path / "nope.json"))
         assert idx is None and source == "unavailable"
 
 

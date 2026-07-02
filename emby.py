@@ -105,7 +105,15 @@ class EmbyIndex:
         self.movie_tmdb = set()        # str tmdb ids
         self.movie_imdb = set()        # str imdb ids, lowercased
         self.movie_title_year = set()  # (normalized_title, int_year)
+        # ALL owned episodes by name — used as the loose fallback when the VOD
+        # side has no known year (or the cache predates year-awareness).
         self.episode_by_name = set()   # (normalized_series, season, episode)
+        # Owned episodes whose SERIES has no known year — matches any queried
+        # year loosely (we can't disambiguate a remake without a year on our end).
+        self.episode_by_name_yearless = set()  # (normalized_series, season, episode)
+        # Owned episodes whose series year IS known — the year-scoped path, so
+        # The Office (2005) doesn't false-positive against The Office (2001).
+        self.episode_by_name_year = set()  # (normalized_series, int_year, season, episode)
         self.episode_by_tmdb = set()   # (str series_tmdb, season, episode)
 
     def add_movie(self, name, year, tmdb_id=None, imdb_id=None):
@@ -117,11 +125,15 @@ class EmbyIndex:
         if key and year:
             self.movie_title_year.add((key, int(year)))
 
-    def add_episode(self, series_name, season, episode, series_tmdb_id=None):
+    def add_episode(self, series_name, season, episode, series_tmdb_id=None, series_year=None):
         s, e = int(season), int(episode)
         key = normalize_title(series_name)
         if key:
-            self.episode_by_name.add((key, s, e))
+            self.episode_by_name.add((key, s, e))  # always — loose fallback
+            if series_year:
+                self.episode_by_name_year.add((key, int(series_year), s, e))
+            else:
+                self.episode_by_name_yearless.add((key, s, e))
         if series_tmdb_id:
             self.episode_by_tmdb.add((str(series_tmdb_id), s, e))
 
@@ -138,12 +150,23 @@ class EmbyIndex:
         y = int(year)
         return any((key, cand) in self.movie_title_year for cand in (y, y - 1, y + 1))
 
-    def has_episode(self, series_title, season, episode, series_tmdb_id=None):
+    def has_episode(self, series_title, season, episode, series_tmdb_id=None, series_year=None):
         s, e = int(season), int(episode)
         if series_tmdb_id and (str(series_tmdb_id), s, e) in self.episode_by_tmdb:
             return True
         key = normalize_title(series_title)
-        return bool(key) and (key, s, e) in self.episode_by_name
+        if not key:
+            return False
+        if not series_year:
+            # No year on the VOD side — loose match (original behavior).
+            return (key, s, e) in self.episode_by_name
+        # Year known on both sides: match a yearless-owned series (can't
+        # disambiguate) OR an owned series whose year is within ±1 (metadata
+        # sources routinely disagree by a year).
+        if (key, s, e) in self.episode_by_name_yearless:
+            return True
+        y = int(series_year)
+        return any((key, cand, s, e) in self.episode_by_name_year for cand in (y - 1, y, y + 1))
 
     @property
     def is_empty(self):
@@ -164,6 +187,8 @@ class EmbyIndex:
             "movie_imdb": sorted(self.movie_imdb),
             "movie_title_year": sorted(self.movie_title_year),
             "episode_by_name": sorted(self.episode_by_name),
+            "episode_by_name_yearless": sorted(self.episode_by_name_yearless),
+            "episode_by_name_year": sorted(self.episode_by_name_year),
             "episode_by_tmdb": sorted(self.episode_by_tmdb),
         }
 
@@ -175,6 +200,17 @@ class EmbyIndex:
         idx.movie_title_year = {(t, int(y)) for t, y in data["movie_title_year"]}
         idx.episode_by_name = {(n, int(s), int(e)) for n, s, e in data["episode_by_name"]}
         idx.episode_by_tmdb = {(str(i), int(s), int(e)) for i, s, e in data["episode_by_tmdb"]}
+        # NEW keys default sensibly so an old cache file (v1 without them) still
+        # loads: yearless defaults to the full name set (loose = old behavior),
+        # year-scoped defaults to empty.
+        idx.episode_by_name_yearless = {
+            (n, int(s), int(e))
+            for n, s, e in data.get("episode_by_name_yearless", data["episode_by_name"])
+        }
+        idx.episode_by_name_year = {
+            (n, int(y), int(s), int(e))
+            for n, y, s, e in data.get("episode_by_name_year", [])
+        }
         return idx
 
 
@@ -201,6 +237,8 @@ def resolve_library_ids(base_url, api_key, library_names):
     so a typo in settings produces an actionable message.
     """
     folders = _http_get_json(base_url, "/emby/Library/VirtualFolders", {}, api_key)
+    if isinstance(folders, dict):
+        folders = folders.get("Items") or []
     by_lower = {(f.get("Name") or "").lower(): f for f in folders}
     resolved, missing = {}, []
     for want in library_names:
@@ -208,7 +246,15 @@ def resolve_library_ids(base_url, api_key, library_names):
         if f is None:
             missing.append(want.strip())
         else:
-            resolved[f["Name"]] = str(f.get("ItemId") or f.get("Id") or "")
+            lib_id = str(f.get("ItemId") or f.get("Id") or "")
+            if not lib_id:
+                # An empty ParentId makes /emby/Items query the WHOLE server,
+                # counting items outside the chosen libraries as "owned" — refuse.
+                raise EmbyError(
+                    f"Emby library '{f.get('Name') or want.strip()}' has no ItemId "
+                    "— cannot scope the query"
+                )
+            resolved[f["Name"]] = lib_id
     if missing:
         available = ", ".join(sorted(f.get("Name", "?") for f in folders))
         raise EmbyError(
@@ -273,11 +319,13 @@ def fetch_index(base_url, api_key, library_names, logger, page_size=1000):
                           tmdb_id=tmdb, imdb_id=imdb)
             movies += 1
         series_tmdb_by_id = {}
+        series_year_by_id = {}
         for item in _iter_items(base_url, api_key, lib_id, "Series",
-                                "ProviderIds,Path", page_size):
+                                "ProviderIds,ProductionYear,Path", page_size):
             tmdb, _ = _provider_ids(item)
             if tmdb:
                 series_tmdb_by_id[item.get("Id")] = str(tmdb)
+            series_year_by_id[item.get("Id")] = item.get("ProductionYear")
         for item in _iter_items(base_url, api_key, lib_id, "Episode",
                                 "Path,ParentIndexNumber,IndexNumber,SeriesName,SeriesId",
                                 page_size):
@@ -287,7 +335,8 @@ def fetch_index(base_url, api_key, library_names, logger, page_size=1000):
             if season is None or ep is None:
                 continue
             idx.add_episode(item.get("SeriesName") or "", season, ep,
-                            series_tmdb_id=series_tmdb_by_id.get(item.get("SeriesId")))
+                            series_tmdb_id=series_tmdb_by_id.get(item.get("SeriesId")),
+                            series_year=series_year_by_id.get(item.get("SeriesId")))
             episodes += 1
         logger.info("Emby library '%s': %d movies, %d episodes indexed", lib_name, movies, episodes)
     if idx.is_empty:
@@ -369,7 +418,10 @@ def build_emby_index(settings, logger, cache_path):
         idx = fetch_index(base_url, api_key, libraries, logger)
         save_cache(idx, cache_path, logger)
         return idx, "live"
-    except EmbyError as e:
+    except Exception as e:
+        # Catch broadly (not just EmbyError): mis-shaped Emby data can escape
+        # the fetch path as AttributeError/TypeError/ValueError, and those must
+        # take the same cache/unavailable fallback instead of crashing the action.
         logger.warning("Emby fetch failed: %s", e)
         cached = load_cache(cache_path, logger)
         if cached is not None and not cached.is_empty:

@@ -138,6 +138,31 @@ class TestCleanupOwnedSeries:
         assert res["deleted_strm"] == 1
         assert os.path.exists(os.path.join(root, "BEEF (2023)", "Season 02", "BEEF - S02E07 - Episode 7.strm"))
 
+    def test_wrong_year_folder_not_deleted(self, p, log, tmp_path):
+        # Index owns The Office (2005) S01E01; a folder for The Office (2001)
+        # must NOT be deleted — the year on the folder disambiguates the remake.
+        root = str(tmp_path)
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        strm = os.path.join(root, "The Office (2001)", "Season 01",
+                            "The Office - S01E01 - Downsize.strm")
+        write(strm)
+        res = p._cleanup_owned_series(root, i, False, log)
+        assert res["deleted_strm"] == 0
+        assert os.path.exists(strm)
+
+    def test_matching_year_folder_deleted(self, p, log, tmp_path):
+        # Companion: same index, but the folder year matches → deleted.
+        root = str(tmp_path)
+        i = EmbyIndex()
+        i.add_episode("The Office", 1, 1, series_year=2005)
+        strm = os.path.join(root, "The Office (2005)", "Season 01",
+                            "The Office - S01E01 - Pilot.strm")
+        write(strm)
+        res = p._cleanup_owned_series(root, i, False, log)
+        assert res["deleted_strm"] == 1
+        assert not os.path.exists(strm)
+
 
 class TestCleanupOwnedAction:
     def test_none_index_refuses(self, p, log, tmp_path):

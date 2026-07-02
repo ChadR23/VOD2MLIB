@@ -21,11 +21,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # package module or as a flat file, so try relative first, then flat with the
 # plugin dir on sys.path (which is also how the tests import it).
 try:
-    from .emby import build_emby_index, trigger_library_refresh, parse_movie_folder, parse_episode_strm
+    from .emby import (build_emby_index, trigger_library_refresh, parse_movie_folder,
+                       parse_episode_strm, fetch_index, save_cache, _parse_libraries, EmbyError)
 except ImportError:
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from emby import build_emby_index, trigger_library_refresh, parse_movie_folder, parse_episode_strm
+    from emby import (build_emby_index, trigger_library_refresh, parse_movie_folder,
+                      parse_episode_strm, fetch_index, save_cache, _parse_libraries, EmbyError)
 
 # Distinguishes "caller didn't pass an index" (resolve it from settings)
 # from "caller resolved it and got None" (dedup off/unavailable — do NOT
@@ -253,7 +255,7 @@ class Plugin:
             "label": "Remove owned items during rescan",
             "type": "boolean",
             "default": True,
-            "help_text": "After each full rescan, delete previously-written .strm/.nfo for content you now own for real. Also available manually via '[EMBY] Remove owned duplicates'.",
+            "help_text": "After each full rescan, delete previously-written .strm/.nfo for content you now own for real. Also available manually via '[EMBY] Remove owned duplicates'. Note: with this OFF while 'Skip owned' is ON, previously-written owned .strm files are never URL-refreshed and will go stale.",
         },
         {
             "id": "emby_dry_run",
@@ -992,6 +994,10 @@ class Plugin:
             os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
         )
         index, source = build_emby_index(settings, logger, cache_path)
+        # Stash the source for auditability (e.g. _cleanup_owned logs it so a
+        # stale-cache deletion is traceable). Signature/return unchanged — other
+        # callers still get just the index.
+        self._emby_index_source = source
         if index is not None:
             logger.info("Emby dedup index ready (source: %s) — %s", source, index.summary())
         return index
@@ -1002,11 +1008,14 @@ class Plugin:
         imdb_id = (getattr(movie, "imdb_id", "") or "").strip() or None
         return emby_index.has_movie(clean_name, year, tmdb_id=tmdb_id, imdb_id=imdb_id)
 
-    def _emby_owned_episode(self, emby_index, series, series_name, season_num, episode_num) -> bool:
+    def _emby_owned_episode(self, emby_index, series, series_name, season_num, episode_num, series_year=None) -> bool:
         """True when this exact episode exists as a real file in Emby.
-        Matches on series identity + S/E numbers only — never episode titles."""
+        Matches on series identity + S/E numbers only — never episode titles.
+        The series year (when known on both sides) disambiguates same-name
+        remakes, e.g. The Office (2005) vs (2001)."""
         tmdb_id = (getattr(series, "tmdb_id", "") or "").strip() or None
-        return emby_index.has_episode(series_name, season_num, episode_num, series_tmdb_id=tmdb_id)
+        return emby_index.has_episode(series_name, season_num, episode_num,
+                                      series_tmdb_id=tmdb_id, series_year=series_year)
 
     def _generate_series(self, settings: Dict[str, Any], logger, emby_index=_EMBY_UNSET):
         """Generate series .strm files with episodes using parallel processing."""
@@ -1253,7 +1262,7 @@ class Plugin:
 
         series = series_rel.series
         cat_name = series_rel.category.name if series_rel.category else ""
-        series_folder, series_name, _year = self._series_target_folder(
+        series_folder, series_name, series_year = self._series_target_folder(
             series, series_root, cat_name, nest_by_cat, append_tmdb_id,
         )
 
@@ -1303,6 +1312,7 @@ class Plugin:
                         emby_index, series, series_name,
                         episode_rel.episode.season_number or 0,
                         episode_rel.episode.episode_number or 0,
+                        series_year=series_year,
                     )
                 )
                 if owned_count == episode_count:
@@ -1338,7 +1348,7 @@ class Plugin:
                 season_num = episode.season_number or 0
                 episode_num = episode.episode_number or 0
 
-                if emby_skip and self._emby_owned_episode(emby_index, series, series_name, season_num, episode_num):
+                if emby_skip and self._emby_owned_episode(emby_index, series, series_name, season_num, episode_num, series_year=series_year):
                     owned_skipped += 1
                     if emby_dry:
                         logger.info("  [EMBY DRY-RUN] owned, would skip: %s S%02dE%02d", series_name, season_num, episode_num)
@@ -1539,10 +1549,11 @@ class Plugin:
             return result
         for dirpath, _, filenames in os.walk(root):
             folder_name = os.path.basename(dirpath)
+            # Folder identity is constant per directory — parse once, not per file.
+            title, year, tmdb_id = parse_movie_folder(folder_name)
             for name in filenames:
-                if not name.endswith(".strm"):
+                if not name.lower().endswith(".strm"):
                     continue
-                title, year, tmdb_id = parse_movie_folder(folder_name)
                 if not emby_index.has_movie(title, year, tmdb_id=tmdb_id):
                     continue
                 verb = "[EMBY DRY-RUN] would delete" if dry else "[EMBY] deleting owned"
@@ -1568,13 +1579,14 @@ class Plugin:
             if not os.path.basename(dirpath).startswith("Season"):
                 continue
             show_dir = os.path.dirname(dirpath)
-            show_title, _show_year, show_tmdb = parse_movie_folder(os.path.basename(show_dir))
+            show_title, show_year, show_tmdb = parse_movie_folder(os.path.basename(show_dir))
             for name in filenames:
                 parsed = parse_episode_strm(name)
                 if parsed is None:
                     continue
                 _series_from_file, season, episode = parsed
-                if not emby_index.has_episode(show_title, season, episode, series_tmdb_id=show_tmdb):
+                if not emby_index.has_episode(show_title, season, episode,
+                                              series_tmdb_id=show_tmdb, series_year=show_year):
                     continue
                 verb = "[EMBY DRY-RUN] would delete" if dry else "[EMBY] deleting owned"
                 logger.info("%s: %s", verb, os.path.join(dirpath, name))
@@ -1613,6 +1625,7 @@ class Plugin:
         movies_root = settings.get("root_folder", "/VODS/Movies")
         series_root = settings.get("series_root_folder", "/VODS/Series")
         logger.info("Emby owned-content cleanup%s:", " (DRY RUN)" if dry else "")
+        logger.info("Cleanup index source: %s", getattr(self, "_emby_index_source", "unknown"))
         m = self._cleanup_owned_movies(movies_root, emby_index, dry, logger)
         s = self._cleanup_owned_series(series_root, emby_index, dry, logger)
         totals = {k: m[k] + s[k] for k in m}
@@ -1629,13 +1642,40 @@ class Plugin:
         return {"status": "ok", "message": msg, **totals}
 
     def _emby_test(self, settings: Dict[str, Any], logger):
-        """Connection test: build the index live and report what it sees."""
-        settings = {**settings, "emby_enabled": True}
-        index = self._get_emby_index(settings, logger)
-        if index is None:
+        """Connection test: LIVE fetch only — never falls back to the cache.
+
+        _get_emby_index silently uses the stale cache when Emby is down, so it
+        could report "OK" while Emby is unreachable. This does a real fetch so
+        the test fails loudly when Emby is down. A missing emby_enabled flag is
+        fine here — a live connectivity test doesn't need the master switch.
+        """
+        base_url = (settings.get("emby_url") or "").strip().rstrip("/")
+        api_key = (settings.get("emby_api_key") or "").strip()
+        libraries = _parse_libraries(settings.get("emby_libraries"))
+        missing = []
+        if not base_url.startswith(("http://", "https://")):
+            missing.append("Emby URL missing or not http(s)")
+        if not api_key:
+            missing.append("Emby API key missing")
+        if not libraries:
+            missing.append("Emby libraries list empty")
+        if missing:
             return {"status": "error",
-                    "message": "Could not build Emby index — check URL, API key, and library names in the log."}
-        return {"status": "ok", "message": f"Emby connection OK — {index.summary()}."}
+                    "message": "Emby not configured: " + "; ".join(missing) + "."}
+        try:
+            index = fetch_index(base_url, api_key, libraries, logger)
+        except Exception as e:
+            return {"status": "error",
+                    "message": (f"Emby connection FAILED: {e} — check the URL, API key, "
+                                "and library names.")}
+        # Side effect: a good live test primes the fail-safe cache, so a later
+        # rescan that finds Emby down can still dedup against this snapshot.
+        cache_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
+        )
+        save_cache(index, cache_path, logger)
+        return {"status": "ok",
+                "message": f"Emby connection OK (live) — {index.summary()}."}
 
     def _log_config(self, logger, items: Dict[str, Any]) -> None:
         """Log a 'Configuration:' block with key/value pairs."""

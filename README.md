@@ -152,7 +152,7 @@ The `[EMBY DEDUP]` settings section:
 | Dry Run | Log what would be skipped/deleted without touching disk. Use for the first run. |
 | Trigger Emby library refresh | Optional — refresh the Emby library after a cleanup pass so removals are picked up faster. |
 
-Matching is by TMDB/IMDB id, or normalized title+year for movies (±1yr) and series name + `SxxEyy` numbers for episodes — never episode titles. On an Emby fetch failure the last good index (JSON cache) is reused; with no cache, dedup is fully disabled for that run, so nothing is skipped or deleted on bad data.
+Matching is by TMDB/IMDB id, or normalized title+year for movies (±1yr). Series match by name + `SxxEyy` numbers, with the series **year** compared when both sides know it (±1yr — so *The Office* (2005) doesn't collide with the (2001) remake; unknown years on either side match loosely), plus a TMDB-id override — never episode titles. On an Emby fetch failure the last good index (JSON cache) is reused; with no cache, dedup is fully disabled for that run, so nothing is skipped or deleted on bad data.
 
 **First run (do a dry run first).**
 1. `[EMBY DEDUP]`: Enable ON, set URL / API key / libraries, **Dry Run ON**, Save.

@@ -146,7 +146,7 @@
       "label": "Remove owned items during rescan",
       "type": "boolean",
       "default": true,
-      "help_text": "After each full rescan, delete previously-written .strm/.nfo for content you now own for real. Also available manually via '[EMBY] Remove owned duplicates'."
+      "help_text": "After each full rescan, delete previously-written .strm/.nfo for content you now own for real. Also available manually via '[EMBY] Remove owned duplicates'. Note: with this OFF while 'Skip owned' is ON, previously-written owned .strm files are never URL-refreshed and will go stale."
     },
     {
       "id": "emby_dry_run",
