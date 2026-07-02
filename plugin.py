@@ -21,11 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # package module or as a flat file, so try relative first, then flat with the
 # plugin dir on sys.path (which is also how the tests import it).
 try:
-    from .emby import build_emby_index, trigger_library_refresh
+    from .emby import build_emby_index, trigger_library_refresh, parse_movie_folder, parse_episode_strm
 except ImportError:
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from emby import build_emby_index, trigger_library_refresh
+    from emby import build_emby_index, trigger_library_refresh, parse_movie_folder, parse_episode_strm
 
 # Distinguishes "caller didn't pass an index" (resolve it from settings)
 # from "caller resolved it and got None" (dedup off/unavailable — do NOT
@@ -441,6 +441,27 @@ class Plugin:
             },
         },
         {
+            "id": "emby_test",
+            "label": "[EMBY] Test connection",
+            "description": "Fetch the owned-content index from Emby and report counts. Read-only.",
+            "button_label": "Test",
+            "button_variant": "outline",
+            "button_color": "blue",
+        },
+        {
+            "id": "cleanup_owned",
+            "label": "[EMBY] Remove owned duplicates",
+            "description": "Delete .strm/.nfo for items that exist as real files in your Emby libraries. Respects Dry Run.",
+            "button_label": "Remove dupes",
+            "button_variant": "filled",
+            "button_color": "orange",
+            "confirm": {
+                "required": True,
+                "title": "Remove .strm files for owned content?",
+                "message": "Deletes every generated .strm/.nfo whose movie or episode exists as a real (non-.strm) file in the Emby libraries you configured. With Dry Run ON this only logs what would be deleted. Continue?",
+            },
+        },
+        {
             "id": "cleanup_movies",
             "label": "[⚠ DANGER] Clean up Movies",
             "description": "Delete plugin .strm/.nfo from Movies root. User files preserved.",
@@ -488,6 +509,10 @@ class Plugin:
             return self._cleanup_movies(settings, logger)
         elif action == "cleanup_series":
             return self._cleanup_series(settings, logger)
+        elif action == "cleanup_owned":
+            return self._cleanup_owned(settings, logger)
+        elif action == "emby_test":
+            return self._emby_test(settings, logger)
         elif action == "rescan_all":
             return self._rescan_all(settings, logger)
         elif action == "apply_schedule":
@@ -1477,6 +1502,140 @@ class Plugin:
             else:
                 result["preserved_dirs"] += 1
         return result
+
+    def _delete_strm_and_nfo(self, strm_path: str, dry: bool, logger, result: dict):
+        """Delete one .strm and its same-basename .nfo (dry: count only)."""
+        nfo_path = strm_path[:-5] + ".nfo"
+        try:
+            if not dry:
+                os.remove(strm_path)
+            result["deleted_strm"] += 1
+            if os.path.isfile(nfo_path):
+                if not dry:
+                    os.remove(nfo_path)
+                result["deleted_nfo"] += 1
+        except OSError as e:
+            logger.error("Failed to delete %s: %s", strm_path, e)
+            result["errors"] += 1
+
+    def _prune_empty_dirs(self, root: str, result: dict):
+        """Bottom-up rmdir pass, same contract as _walk_and_cleanup_plugin_files
+        pass 2: never removes root, preserves dirs with user files."""
+        root_real = os.path.realpath(root)
+        for dirpath, _, _ in os.walk(root, topdown=False):
+            if os.path.realpath(dirpath) == root_real:
+                continue
+            if self._try_rmdir(dirpath):
+                result["removed_dirs"] += 1
+
+    def _cleanup_owned_movies(self, root: str, emby_index, dry: bool, logger):
+        """Delete .strm/.nfo for movies that exist as real files in Emby.
+
+        Identity comes from the movie FOLDER name ('Title (Year) {tmdb-N}'),
+        which works for both flat and category-nested layouts.
+        """
+        result = {"deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "errors": 0}
+        if not os.path.isdir(root):
+            return result
+        for dirpath, _, filenames in os.walk(root):
+            folder_name = os.path.basename(dirpath)
+            for name in filenames:
+                if not name.endswith(".strm"):
+                    continue
+                title, year, tmdb_id = parse_movie_folder(folder_name)
+                if not emby_index.has_movie(title, year, tmdb_id=tmdb_id):
+                    continue
+                verb = "[EMBY DRY-RUN] would delete" if dry else "[EMBY] deleting owned"
+                logger.info("%s: %s", verb, os.path.join(dirpath, name))
+                self._delete_strm_and_nfo(os.path.join(dirpath, name), dry, logger, result)
+        if not dry:
+            self._prune_empty_dirs(root, result)
+        return result
+
+    def _cleanup_owned_series(self, root: str, emby_index, dry: bool, logger):
+        """Delete episode .strm/.nfo owned as real files in Emby.
+
+        Layout: <root>[/Category]/Show (Year) {tmdb-N}/Season NN/Show - SxxEyy - Title.strm
+        Series identity comes from the show folder (grandparent of the file);
+        S/E numbers come from the filename. tvshow.nfo is removed only when a
+        show folder has no .strm files left.
+        """
+        result = {"deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "errors": 0}
+        if not os.path.isdir(root):
+            return result
+        touched_show_dirs = set()
+        for dirpath, _, filenames in os.walk(root):
+            if not os.path.basename(dirpath).startswith("Season"):
+                continue
+            show_dir = os.path.dirname(dirpath)
+            show_title, _show_year, show_tmdb = parse_movie_folder(os.path.basename(show_dir))
+            for name in filenames:
+                parsed = parse_episode_strm(name)
+                if parsed is None:
+                    continue
+                _series_from_file, season, episode = parsed
+                if not emby_index.has_episode(show_title, season, episode, series_tmdb_id=show_tmdb):
+                    continue
+                verb = "[EMBY DRY-RUN] would delete" if dry else "[EMBY] deleting owned"
+                logger.info("%s: %s", verb, os.path.join(dirpath, name))
+                self._delete_strm_and_nfo(os.path.join(dirpath, name), dry, logger, result)
+                touched_show_dirs.add(show_dir)
+        if not dry:
+            for show_dir in touched_show_dirs:
+                strm_left = any(
+                    f.endswith(".strm")
+                    for _, _, files in os.walk(show_dir) for f in files
+                )
+                if not strm_left:
+                    tvshow_nfo = os.path.join(show_dir, "tvshow.nfo")
+                    if os.path.isfile(tvshow_nfo):
+                        try:
+                            os.remove(tvshow_nfo)
+                            result["deleted_nfo"] += 1
+                        except OSError as e:
+                            logger.error("Failed to delete %s: %s", tvshow_nfo, e)
+                            result["errors"] += 1
+            self._prune_empty_dirs(root, result)
+        return result
+
+    def _cleanup_owned(self, settings: Dict[str, Any], logger, emby_index=_EMBY_UNSET):
+        """Remove .strm/.nfo for content owned as real files in Emby."""
+        if emby_index is _EMBY_UNSET:
+            emby_index = self._get_emby_index(settings, logger)
+        if emby_index is None:
+            msg = "Emby dedup is disabled, misconfigured, or Emby is unavailable with no cache — nothing removed."
+            logger.warning(msg)
+            return {"status": "error", "message": msg}
+        if not settings.get("emby_remove_owned", True):
+            return {"status": "ok", "message": "Remove-owned is OFF — nothing to do.",
+                    "deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "errors": 0}
+        dry = bool(settings.get("emby_dry_run", False))
+        movies_root = settings.get("root_folder", "/VODS/Movies")
+        series_root = settings.get("series_root_folder", "/VODS/Series")
+        logger.info("Emby owned-content cleanup%s:", " (DRY RUN)" if dry else "")
+        m = self._cleanup_owned_movies(movies_root, emby_index, dry, logger)
+        s = self._cleanup_owned_series(series_root, emby_index, dry, logger)
+        totals = {k: m[k] + s[k] for k in m}
+        verb = "Would remove" if dry else "Removed"
+        msg = (f"{verb} {totals['deleted_strm']} owned .strm + {totals['deleted_nfo']} .nfo "
+               f"({m['deleted_strm']} movies, {s['deleted_strm']} episodes)")
+        if totals["errors"]:
+            msg += f", {totals['errors']} errors — see logs"
+        logger.info(msg)
+        if not dry and totals["deleted_strm"] and settings.get("emby_trigger_refresh", False):
+            base_url = (settings.get("emby_url") or "").strip().rstrip("/")
+            api_key = (settings.get("emby_api_key") or "").strip()
+            trigger_library_refresh(base_url, api_key, logger)
+        return {"status": "ok", "message": msg, **totals}
+
+    def _emby_test(self, settings: Dict[str, Any], logger):
+        """Connection test: build the index live and report what it sees."""
+        settings = {**settings, "emby_enabled": True}
+        index = self._get_emby_index(settings, logger)
+        if index is None:
+            return {"status": "error",
+                    "message": "Could not build Emby index — check URL, API key, and library names in the log."}
+        return {"status": "ok", "message": f"Emby connection OK — {index.summary()}."}
 
     def _log_config(self, logger, items: Dict[str, Any]) -> None:
         """Log a 'Configuration:' block with key/value pairs."""
