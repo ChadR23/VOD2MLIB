@@ -422,7 +422,7 @@ def build_emby_index(settings, logger, cache_path):
         # Catch broadly (not just EmbyError): mis-shaped Emby data can escape
         # the fetch path as AttributeError/TypeError/ValueError, and those must
         # take the same cache/unavailable fallback instead of crashing the action.
-        logger.warning("Emby fetch failed: %s", e)
+        logger.warning("Emby fetch failed: %s: %s", type(e).__name__, e)
         cached = load_cache(cache_path, logger)
         if cached is not None and not cached.is_empty:
             logger.warning("Using last good Emby index from cache (stale-but-safe).")

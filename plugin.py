@@ -22,12 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # plugin dir on sys.path (which is also how the tests import it).
 try:
     from .emby import (build_emby_index, trigger_library_refresh, parse_movie_folder,
-                       parse_episode_strm, fetch_index, save_cache, _parse_libraries, EmbyError)
+                       parse_episode_strm, fetch_index, save_cache, _parse_libraries)
 except ImportError:
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from emby import (build_emby_index, trigger_library_refresh, parse_movie_folder,
-                      parse_episode_strm, fetch_index, save_cache, _parse_libraries, EmbyError)
+                      parse_episode_strm, fetch_index, save_cache, _parse_libraries)
 
 # Distinguishes "caller didn't pass an index" (resolve it from settings)
 # from "caller resolved it and got None" (dedup off/unavailable — do NOT
@@ -986,13 +986,16 @@ class Plugin:
         except OSError:
             return False
 
+    def _emby_cache_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
+        )
+
     def _get_emby_index(self, settings: Dict[str, Any], logger):
         """Build (or cache-load) the owned-content index. Returns None when
         Emby dedup is disabled, misconfigured, or unavailable-with-no-cache —
         callers treat None as 'no dedup this run'."""
-        cache_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
-        )
+        cache_path = self._emby_cache_path()
         index, source = build_emby_index(settings, logger, cache_path)
         # Stash the source for auditability (e.g. _cleanup_owned logs it so a
         # stale-cache deletion is traceable). Signature/return unchanged — other
@@ -1595,7 +1598,7 @@ class Plugin:
         if not dry:
             for show_dir in touched_show_dirs:
                 strm_left = any(
-                    f.endswith(".strm")
+                    f.lower().endswith(".strm")
                     for _, _, files in os.walk(show_dir) for f in files
                 )
                 if not strm_left:
@@ -1670,9 +1673,7 @@ class Plugin:
                                 "and library names.")}
         # Side effect: a good live test primes the fail-safe cache, so a later
         # rescan that finds Emby down can still dedup against this snapshot.
-        cache_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "emby_index_cache.json",
-        )
+        cache_path = self._emby_cache_path()
         save_cache(index, cache_path, logger)
         return {"status": "ok",
                 "message": f"Emby connection OK (live) — {index.summary()}."}
