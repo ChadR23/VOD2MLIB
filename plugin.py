@@ -703,7 +703,7 @@ class Plugin:
             return base_name
         return f"{base_name} {{tmdb-{tmdb_id}}}"
 
-    def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
+    def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False, emby_index=_EMBY_UNSET):
         """Generate movie .strm files according to batch size.
 
         Lazily walks M3UMovieRelation via iterator() so the batch limit is
@@ -724,6 +724,11 @@ class Plugin:
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
+
+        if emby_index is _EMBY_UNSET:
+            emby_index = self._get_emby_index(settings, logger)
+        emby_skip = emby_index is not None and bool(settings.get("emby_skip_owned", True))
+        emby_dry = bool(settings.get("emby_dry_run", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -785,6 +790,7 @@ class Plugin:
         deduped = 0
         errors = 0
         scanned = 0
+        owned_skipped = 0
 
         # seen-set is only used when dedupe is on; kept as None otherwise so the
         # membership check short-circuits cheaply for everyone else.
@@ -808,6 +814,14 @@ class Plugin:
                 movie, root_folder, cat_name, nest_by_cat, append_tmdb_id,
             )
             strm_path = os.path.join(movie_folder, strm_filename)
+
+            if emby_skip and self._emby_owned_movie(emby_index, movie_name, year, movie):
+                owned_skipped += 1
+                if emby_dry:
+                    logger.info("  [EMBY DRY-RUN] owned, would skip: %s (%s)", movie_name, year or "—")
+                else:
+                    continue
+
             is_existing = os.path.exists(strm_path)
 
             if is_existing and not refresh_existing:
@@ -870,6 +884,9 @@ class Plugin:
         logger.info("  Total relations: %d", total_count)
         logger.info("  Scanned:         %d", scanned)
         logger.info("  Already on disk: %d", skipped)
+        if emby_skip:
+            label = "Owned in Emby (would skip)" if emby_dry else "Owned in Emby (skipped)"
+            logger.info("  %s: %d", label, owned_skipped)
         if dedupe_across_cats:
             logger.info("  Deduped (multi-cat): %d", deduped)
         logger.info("  .strm created:   %d", created_strm)
@@ -889,6 +906,9 @@ class Plugin:
             summary_msg += f" ({skipped} already on disk)"
         if dedupe_across_cats and deduped:
             summary_msg += f", deduped {deduped} multi-category duplicates"
+        if emby_skip and owned_skipped:
+            verb = "would skip" if emby_dry else "skipped"
+            summary_msg += f", {verb} {owned_skipped} owned in Emby"
 
         return {
             "status": "ok",
@@ -900,9 +920,10 @@ class Plugin:
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
             "deduped": deduped,
+            "owned_skipped": owned_skipped,
             "errors": errors,
         }
-    
+
     def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
@@ -949,6 +970,12 @@ class Plugin:
         if index is not None:
             logger.info("Emby dedup index ready (source: %s) — %s", source, index.summary())
         return index
+
+    def _emby_owned_movie(self, emby_index, clean_name, year, movie) -> bool:
+        """True when this movie exists as a real file in Emby."""
+        tmdb_id = (getattr(movie, "tmdb_id", "") or "").strip() or None
+        imdb_id = (getattr(movie, "imdb_id", "") or "").strip() or None
+        return emby_index.has_movie(clean_name, year, tmdb_id=tmdb_id, imdb_id=imdb_id)
 
     def _generate_series(self, settings: Dict[str, Any], logger):
         """Generate series .strm files with episodes using parallel processing."""

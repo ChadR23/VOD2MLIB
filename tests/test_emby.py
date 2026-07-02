@@ -348,3 +348,26 @@ class TestBuildEmbyIndex:
         cache.write_text("{not json", encoding="utf-8")
         idx, source = build_emby_index(GOOD_SETTINGS, FakeLogger(), str(cache))
         assert idx is None and source == "unavailable"
+
+
+from plugin import Plugin
+
+
+class FakeMovie:
+    def __init__(self, tmdb_id="", imdb_id=""):
+        self.tmdb_id = tmdb_id
+        self.imdb_id = imdb_id
+
+
+class TestEmbyOwnedMovie:
+    def test_matches_by_title_year(self, idx):
+        p = Plugin()
+        assert p._emby_owned_movie(idx, "Heat", 1995, FakeMovie())
+
+    def test_matches_by_tmdb_when_title_differs(self, idx):
+        p = Plugin()
+        assert p._emby_owned_movie(idx, "Matrix Reloaded Wrong Name", 2003, FakeMovie(tmdb_id="603"))
+
+    def test_blank_ids_treated_as_absent(self, idx):
+        p = Plugin()
+        assert not p._emby_owned_movie(idx, "Barbie", 2023, FakeMovie(tmdb_id="  ", imdb_id=""))
