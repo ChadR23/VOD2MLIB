@@ -159,3 +159,129 @@ class TestEmbyIndexMisc:
     def test_from_dict_garbage_raises(self):
         with pytest.raises(Exception):
             EmbyIndex.from_dict({"movies": "nope"})
+
+
+import emby
+from emby import EmbyError, fetch_index, resolve_library_ids
+
+
+class FakeLogger:
+    def __init__(self):
+        self.warnings, self.errors, self.infos = [], [], []
+    def warning(self, msg, *a): self.warnings.append(msg % a if a else msg)
+    def error(self, msg, *a): self.errors.append(msg % a if a else msg)
+    def info(self, msg, *a): self.infos.append(msg % a if a else msg)
+
+
+VIRTUAL_FOLDERS = [
+    {"Name": "Movies", "ItemId": "lib1", "CollectionType": "movies"},
+    {"Name": "TV Shows", "ItemId": "lib2", "CollectionType": "tvshows"},
+    {"Name": "Dispatcharr VODs", "ItemId": "lib3", "CollectionType": "tvshows"},
+]
+
+
+def make_fake_http(items_by_type, virtual_folders=VIRTUAL_FOLDERS, page_size_cap=None):
+    """items_by_type: {'Movie': [...], 'Series': [...], 'Episode': [...]}"""
+    def fake(base_url, path, params, api_key, timeout=30):
+        if path == "/emby/Library/VirtualFolders":
+            return virtual_folders
+        assert path == "/emby/Items"
+        typ = params["IncludeItemTypes"]
+        all_items = items_by_type.get(typ, [])
+        start = int(params.get("StartIndex", 0))
+        limit = int(params.get("Limit", 1000))
+        if page_size_cap:
+            limit = min(limit, page_size_cap)
+        return {"Items": all_items[start:start + limit],
+                "TotalRecordCount": len(all_items)}
+    return fake
+
+
+MOVIE_ITEMS = [
+    {"Name": "The Matrix", "ProductionYear": 1999, "Path": "/jbod/movies/The Matrix (1999)/matrix.mkv",
+     "ProviderIds": {"Tmdb": "603", "Imdb": "tt0133093"}},
+    {"Name": "Heat", "ProductionYear": 1995, "Path": "/jbod/movies/Heat (1995)/heat.mkv",
+     "ProviderIds": {}},
+    # A .strm inside a "real" library must be excluded from the index
+    {"Name": "Sneaky VOD", "ProductionYear": 2024, "Path": "/VODS/Movies/Sneaky VOD (2024)/Sneaky VOD (2024).strm",
+     "ProviderIds": {"Tmdb": "999"}},
+]
+
+SERIES_ITEMS = [
+    {"Id": "ser1", "Name": "BEEF", "Path": "/jbod/tv/BEEF", "ProviderIds": {"Tmdb": "223333"}},
+    {"Id": "ser2", "Name": "Smiling Friends", "Path": "/jbod/tv/Smiling Friends", "ProviderIds": {}},
+]
+
+EPISODE_ITEMS = [
+    {"SeriesId": "ser1", "SeriesName": "BEEF", "ParentIndexNumber": 2, "IndexNumber": 7,
+     "Path": "/jbod/tv/BEEF/S02/BEEF - S02E07 - The Hour of Separation.mkv"},
+    {"SeriesId": "ser2", "SeriesName": "Smiling Friends", "ParentIndexNumber": 1, "IndexNumber": 3,
+     "Path": "/jbod/tv/Smiling Friends/S01/ep.mkv"},
+    # .strm episode must be excluded
+    {"SeriesId": "ser1", "SeriesName": "BEEF", "ParentIndexNumber": 2, "IndexNumber": 8,
+     "Path": "/VODS/Series/BEEF/Season 02/BEEF - S02E08.strm"},
+    # Missing numbers must be skipped, not crash
+    {"SeriesId": "ser2", "SeriesName": "Smiling Friends", "ParentIndexNumber": None, "IndexNumber": 4,
+     "Path": "/jbod/tv/x.mkv"},
+]
+
+
+class TestResolveLibraryIds:
+    def test_resolves_case_insensitive(self, monkeypatch):
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http({}))
+        ids = resolve_library_ids("http://emby:8096", "k", ["movies", "TV SHOWS"])
+        assert ids == {"Movies": "lib1", "TV Shows": "lib2"}
+
+    def test_missing_library_raises_with_available_names(self, monkeypatch):
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http({}))
+        with pytest.raises(EmbyError) as exc:
+            resolve_library_ids("http://emby:8096", "k", ["Moviez"])
+        assert "Moviez" in str(exc.value)
+        assert "Movies" in str(exc.value)  # lists what IS available
+
+
+class TestFetchIndex:
+    def fetch(self, monkeypatch, **kw):
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {"Movie": MOVIE_ITEMS, "Series": SERIES_ITEMS, "Episode": EPISODE_ITEMS}, **kw))
+        return fetch_index("http://emby:8096", "k", ["Movies", "TV Shows"], FakeLogger())
+
+    def test_movies_indexed(self, monkeypatch):
+        idx = self.fetch(monkeypatch)
+        assert idx.has_movie("The Matrix", 1999)
+        assert idx.has_movie("x", None, tmdb_id="603")
+        assert idx.has_movie("Heat", 1995)
+
+    def test_strm_items_excluded(self, monkeypatch):
+        idx = self.fetch(monkeypatch)
+        assert not idx.has_movie("Sneaky VOD", 2024)
+        assert not idx.has_movie("x", None, tmdb_id="999")
+        assert not idx.has_episode("BEEF", 2, 8)
+
+    def test_episodes_indexed_by_name_and_series_tmdb(self, monkeypatch):
+        idx = self.fetch(monkeypatch)
+        assert idx.has_episode("BEEF", 2, 7)
+        assert idx.has_episode("anything", 2, 7, series_tmdb_id="223333")
+        assert idx.has_episode("Smiling Friends", 1, 3)
+
+    def test_episode_missing_numbers_skipped(self, monkeypatch):
+        idx = self.fetch(monkeypatch)
+        assert not idx.has_episode("Smiling Friends", 0, 4)
+
+    def test_pagination(self, monkeypatch):
+        idx = self.fetch(monkeypatch, page_size_cap=1)  # force many pages
+        assert idx.has_movie("Heat", 1995)
+        assert idx.has_episode("Smiling Friends", 1, 3)
+
+    def test_empty_index_raises(self, monkeypatch):
+        monkeypatch.setattr(emby, "_http_get_json", make_fake_http(
+            {"Movie": [], "Series": [], "Episode": []}))
+        with pytest.raises(EmbyError):
+            fetch_index("http://emby:8096", "k", ["Movies"], FakeLogger())
+
+    def test_http_error_propagates_as_emby_error(self, monkeypatch):
+        def boom(*a, **kw):
+            raise EmbyError("connection refused")
+        monkeypatch.setattr(emby, "_http_get_json", boom)
+        with pytest.raises(EmbyError):
+            fetch_index("http://emby:8096", "k", ["Movies"], FakeLogger())

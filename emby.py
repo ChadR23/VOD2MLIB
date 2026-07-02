@@ -176,3 +176,138 @@ class EmbyIndex:
         idx.episode_by_name = {(n, int(s), int(e)) for n, s, e in data["episode_by_name"]}
         idx.episode_by_tmdb = {(str(i), int(s), int(e)) for i, s, e in data["episode_by_tmdb"]}
         return idx
+
+
+# ---------- Emby HTTP API ----------
+
+def _http_get_json(base_url, path, params, api_key, timeout=30):
+    """GET an Emby endpoint, return parsed JSON. API key goes in the
+    X-Emby-Token header so it never shows up in logged URLs."""
+    url = f"{base_url}{path}"
+    if params:
+        url += "?" + urlencode(params)
+    req = Request(url, headers={"X-Emby-Token": api_key, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise EmbyError(f"GET {path} failed: {e}") from e
+
+
+def resolve_library_ids(base_url, api_key, library_names):
+    """Map configured library names -> Emby ItemIds (case-insensitive).
+
+    Raises EmbyError naming both the missing and the available libraries,
+    so a typo in settings produces an actionable message.
+    """
+    folders = _http_get_json(base_url, "/emby/Library/VirtualFolders", {}, api_key)
+    by_lower = {(f.get("Name") or "").lower(): f for f in folders}
+    resolved, missing = {}, []
+    for want in library_names:
+        f = by_lower.get(want.strip().lower())
+        if f is None:
+            missing.append(want.strip())
+        else:
+            resolved[f["Name"]] = str(f.get("ItemId") or f.get("Id") or "")
+    if missing:
+        available = ", ".join(sorted(f.get("Name", "?") for f in folders))
+        raise EmbyError(
+            f"Emby libraries not found: {', '.join(missing)}. Available: {available}"
+        )
+    return resolved
+
+
+def _iter_items(base_url, api_key, parent_id, item_type, fields, page_size=1000):
+    """Yield all items of item_type under parent_id, following pagination."""
+    start = 0
+    while True:
+        data = _http_get_json(base_url, "/emby/Items", {
+            "ParentId": parent_id,
+            "IncludeItemTypes": item_type,
+            "Recursive": "true",
+            "Fields": fields,
+            "EnableImages": "false",
+            "StartIndex": start,
+            "Limit": page_size,
+        }, api_key)
+        items = data.get("Items") or []
+        for item in items:
+            yield item
+        start += len(items)
+        total = int(data.get("TotalRecordCount") or 0)
+        if not items or start >= total:
+            return
+
+
+def _provider_ids(item):
+    """Case-tolerant ProviderIds lookup: returns (tmdb, imdb) or Nones."""
+    prov = {k.lower(): v for k, v in (item.get("ProviderIds") or {}).items()}
+    return prov.get("tmdb"), prov.get("imdb")
+
+
+def _is_strm(item):
+    return (item.get("Path") or "").lower().endswith(".strm")
+
+
+def fetch_index(base_url, api_key, library_names, logger, page_size=1000):
+    """Build an EmbyIndex of REAL files across the given libraries.
+
+    Items whose Path ends in .strm are excluded — second line of defense
+    so the plugin's own VOD library can never count as "owned" even if a
+    user lists it in emby_libraries by mistake.
+
+    Raises EmbyError on any HTTP failure or if the result is empty
+    (an empty index would authorize mass-deleting nothing-is-owned state,
+    which is far more likely a misconfiguration than reality).
+    """
+    idx = EmbyIndex()
+    lib_ids = resolve_library_ids(base_url, api_key, library_names)
+    for lib_name, lib_id in lib_ids.items():
+        movies = episodes = 0
+        for item in _iter_items(base_url, api_key, lib_id, "Movie",
+                                "ProviderIds,ProductionYear,Path", page_size):
+            if _is_strm(item):
+                continue
+            tmdb, imdb = _provider_ids(item)
+            idx.add_movie(item.get("Name") or "", item.get("ProductionYear"),
+                          tmdb_id=tmdb, imdb_id=imdb)
+            movies += 1
+        series_tmdb_by_id = {}
+        for item in _iter_items(base_url, api_key, lib_id, "Series",
+                                "ProviderIds,Path", page_size):
+            tmdb, _ = _provider_ids(item)
+            if tmdb:
+                series_tmdb_by_id[item.get("Id")] = str(tmdb)
+        for item in _iter_items(base_url, api_key, lib_id, "Episode",
+                                "Path,ParentIndexNumber,IndexNumber,SeriesName,SeriesId",
+                                page_size):
+            if _is_strm(item):
+                continue
+            season, ep = item.get("ParentIndexNumber"), item.get("IndexNumber")
+            if season is None or ep is None:
+                continue
+            idx.add_episode(item.get("SeriesName") or "", season, ep,
+                            series_tmdb_id=series_tmdb_by_id.get(item.get("SeriesId")))
+            episodes += 1
+        logger.info("Emby library '%s': %d movies, %d episodes indexed", lib_name, movies, episodes)
+    if idx.is_empty:
+        raise EmbyError(
+            "Emby returned no owned items across the configured libraries — "
+            "refusing to dedup against an empty index (likely a misconfiguration)."
+        )
+    return idx
+
+
+def trigger_library_refresh(base_url, api_key, logger):
+    """Ask Emby to rescan its libraries so deletions disappear promptly.
+    Best-effort: failures are logged, never raised."""
+    url = f"{base_url}/emby/Library/Refresh"
+    req = Request(url, data=b"", headers={"X-Emby-Token": api_key}, method="POST")
+    try:
+        with urlopen(req, timeout=30):
+            pass
+        logger.info("Triggered Emby library refresh.")
+        return True
+    except Exception as e:
+        logger.warning("Emby library refresh trigger failed (non-fatal): %s", e)
+        return False
